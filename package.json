@@ -1,0 +1,76 @@
+{
+  "name": "df-billing-automation-server",
+  "version": "2.5.0006",
+  "description": "Diet Fantasy billing automation (Playwright)",
+  "author": "POEL AI <info@poel.ai>",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "electron": "electron .",
+    "install-browsers": "cross-env PLAYWRIGHT_BROWSERS_PATH=./playwright-browsers npx playwright install chromium",
+    "postinstall": "node scripts/postinstall-playwright.js",
+    "pack:mac": "npm run install-browsers && electron-builder --mac",
+    "pack:win": "npm run install-browsers && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
+    "dist": "npm run install-browsers && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder",
+    "restart": "node restart.js",
+    "dev": "lsof -ti:3500 | xargs kill -9 2>/dev/null; node src/server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "playwright": "^1.40.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "build": {
+    "appId": "com.dietfantasy.billing-automation",
+    "productName": "Diet Fantasy Billing",
+    "icon": "public/logo.png",
+    "files": [
+      "src/**/*",
+      "public/**/*",
+      "node_modules/**/*",
+      "electron-main.js",
+      ".env",
+      "billing_requests_template.json",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "playwright-browsers",
+        "to": "playwright-browsers",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        "dmg"
+      ]
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true
+    }
+  },
+  "type": "commonjs"
+}

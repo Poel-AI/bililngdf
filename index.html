@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Diet Fantasy Billing</title>
+    <link rel="icon" href="/logo.png" type="image/png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="app-shell">
+        <div class="container">
+        <header class="app-header">
+            <div class="brand">
+                <img src="/logo.png" width="56" height="56" alt="" class="brand-logo">
+                <div class="brand-copy">
+                    <h1 class="brand-title">Diet Fantasy Billing</h1>
+                    <p class="brand-tagline">Load your client list, then run billing. Activity and progress appear below.</p>
+                </div>
+            </div>
+            <button type="button" id="connection-status" class="badge-status" aria-live="polite" disabled
+                title="When status is Connected, triple-click here to show or hide advanced technical settings.">
+                Connecting…
+            </button>
+        </header>
+
+        <section class="settings-bar settings-bar--hidden" id="settings-bar" aria-label="Advanced environment settings">
+            <div class="settings-bar__inner">
+                <span class="settings-bar__label">Advanced</span>
+                <div class="settings-group">
+                    <label for="setting-concurrent-browsers">Browser slots</label>
+                    <input type="number" id="setting-concurrent-browsers" min="1" max="50" step="1"
+                        title="Saved with Save settings" />
+                </div>
+                <button type="button" id="btn-show-browser" class="btn btn-outline btn-toggle"
+                    title="Visible browser window">Show browser: Off</button>
+                <button type="button" id="btn-check-only" class="btn btn-outline btn-toggle"
+                    title="When on, the run will NOT create billing. It counts fee-schedule cards whose service range start matches the client’s start date, or the comma-separated dates below if multi-date is on (end date ignored).">Check-only: Off</button>
+                <button type="button" id="btn-check-only-multi-debug" class="btn btn-outline btn-toggle"
+                    title="With Check-only on: enter comma-separated YYYY-MM-DD dates below to count each date on the page (overrides each client’s server start). Saved to .env.">Multi-date check: Off</button>
+                <button type="button" id="btn-submit-invoice" class="btn btn-outline btn-toggle"
+                    title="When off (testing): fills the billing form but does not click Post; shows a Continue bar until you click it. Saved to .env.">Submit invoice: On</button>
+                <button type="button" id="btn-bill-invoices-endpoint" class="btn btn-outline btn-toggle btn-toggle--on"
+                    title="When on (default): load the queue from GET /api/bill/invoices?date=… and attach the client invoice PDF as proof. When off: legacy GET /api/bill. Saved to .env.">Invoice as proof: On</button>
+                <button type="button" id="btn-save-settings" class="btn btn-outline">Save settings</button>
+                <button type="button" id="btn-open-source-files" class="btn btn-outline">Open source files</button>
+            </div>
+            <div class="settings-bar__dates-row" id="check-only-dates-row" hidden>
+                <div class="settings-group settings-group--wide">
+                    <label for="check-only-dates-input">Check-only dates (YYYY-MM-DD, comma-separated)</label>
+                    <input type="text" id="check-only-dates-input" class="settings-bar__text-input" spellcheck="false"
+                        placeholder="2026-03-30, 2026-04-06, 2026-04-13" autocomplete="off"
+                        title="Used when Check-only and Multi-date check are both on. Saved to .env on change." />
+                </div>
+            </div>
+        </section>
+
+        <section class="panel slots-panel" aria-label="Browser activity">
+            <h2 class="section-heading">Automation slots</h2>
+            <div id="slots-strip" class="slots-strip" aria-label="Active browser slots"></div>
+        </section>
+
+        <section class="panel toolbar" aria-label="Actions">
+            <div id="session-resume-banner" class="session-resume-banner" style="display: none;" role="status" aria-live="polite">
+                <span id="session-resume-text"></span>
+                <button type="button" id="btn-load-session" class="btn btn-outline btn-compact">Load saved session</button>
+                <button type="button" id="btn-resume-session" class="btn btn-primary btn-compact">Resume billing</button>
+                <button type="button" id="btn-dismiss-session" class="btn btn-outline btn-compact">Dismiss</button>
+            </div>
+            <div class="toolbar__row toolbar__row--fields">
+                <div class="toolbar__filters">
+                    <div class="field-group">
+                        <label for="serverSelect">Account</label>
+                        <select id="serverSelect" class="input-select"
+                            title="Brooklyn adds account=brooklyn to the API request; host is always customer.thedietfantasy.com">
+                            <option value="main">Diet Fantasy (Main)</option>
+                            <option value="brooklyn">Brooklyn</option>
+                        </select>
+                    </div>
+                    <div class="field-group">
+                        <label for="bill-date">Billing week starts</label>
+                        <input type="date" id="bill-date" class="input-date" title="First day for the billing list" />
+                    </div>
+                    <div class="field-group">
+                        <label for="date-clamp-mode">Date clamping</label>
+                        <select id="date-clamp-mode" class="input-select" title="Auth window: clamp to scraped limits on the case. Client created: require JSON created-at; error if before case open; skip if case opened in or after billing week. Saved to .env.">
+                            <option value="auth">Auth window (page)</option>
+                            <option value="client_created">Client created date</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="toolbar__row toolbar__row--run">
+                <div class="toolbar__actions">
+                    <button type="button" id="btn-download-bill" class="btn btn-secondary" onclick="downloadAllClients()">
+                        Download client list
+                    </button>
+                    <div class="toolbar__run-block">
+                        <button type="button" id="btn-run-queue" class="btn btn-primary" onclick="runCurrentQueue()">
+                            Run billing
+                        </button>
+                        <button type="button" id="btn-upload-attestations" class="btn btn-outline btn-toggle btn-toggle--compact"
+                            title="When on, builds proof PDFs and attaches them in Unite. When off, that step is skipped.">
+                            Upload proofs: On
+                        </button>
+                    </div>
+                    <button type="button" id="btn-export-excel" class="btn btn-outline">Export to Excel</button>
+                </div>
+                <div class="stats" role="status">
+                    <span class="stat-pill"><span class="stat-pill__label">Total</span> <b id="stat-total">0</b></span>
+                    <span class="stat-pill stat-pill--pending"><span class="stat-pill__label">Waiting</span> <b id="stat-pending">0</b></span>
+                    <span class="stat-pill stat-pill--ok"><span class="stat-pill__label">Done</span> <b id="stat-success">0</b></span>
+                    <span class="stat-pill stat-pill--bad"><span class="stat-pill__label">Failed</span> <b id="stat-failed">0</b></span>
+                </div>
+            </div>
+        </section>
+
+        <div class="main-stack">
+            <section class="panel queue-panel">
+                <div class="queue-panel__header">
+                    <h2 class="section-heading">Client queue</h2>
+                    <div class="queue-panel__filters" role="search">
+                        <div class="field-group queue-search-field">
+                            <label for="queue-client-search">Search clients</label>
+                            <input type="search" id="queue-client-search" class="input-search"
+                                placeholder="Name, id, dates…" autocomplete="off"
+                                title="Filter the table by client name, id, order numbers, or dates" />
+                        </div>
+                        <div class="field-group queue-status-filter">
+                            <label for="queue-status-filter">Show status</label>
+                            <select id="queue-status-filter" class="input-select input-select--narrow"
+                                title="Filter rows by billing status">
+                                <option value="all">All statuses</option>
+                                <option value="pending">Waiting</option>
+                                <option value="processing">In progress</option>
+                                <option value="success">Done</option>
+                                <option value="warning">Submitted (unverified)</option>
+                                <option value="skipped">Skipped</option>
+                                <option value="failed">Failed</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table class="queue-table">
+                        <thead>
+                            <tr>
+                                <th class="col-check" title="Select rows to run only these clients">
+                                    <input type="checkbox" id="queue-select-all" title="Select all">
+                                </th>
+                                <th onclick="sortQueue('id')">#</th>
+                                <th onclick="sortQueue('name')">Client</th>
+                                <th onclick="sortQueue('start')">Dates</th>
+                                <th onclick="sortQueue('created')">Created</th>
+                                <th onclick="sortQueue('url')">Unite case</th>
+                                <th onclick="sortQueue('proofs')">Proof</th>
+                                <th onclick="sortQueue('status')">Status</th>
+                                <th onclick="sortQueue('checkOnlyInvoiceAmounts')" title="Invoice cost from fee-schedule cards (check-only runs)">Invoice cost</th>
+                                <th onclick="sortQueue('message')">Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="queue-body"></tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="panel log-panel log-panel--bottom">
+                <h2 class="section-heading">Activity log</h2>
+                <div id="terminal" class="terminal">
+                    <div class="line dimmed">Waiting for activity…</div>
+                </div>
+            </section>
+        </div>
+        </div>
+    </div>
+    <script src="client.js"></script>
+</body>
+
+</html>

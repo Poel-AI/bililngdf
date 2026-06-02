@@ -1,0 +1,26 @@
+﻿# Dependencies
+node_modules/
+
+# Playwright browsers (installed by npm run install-browsers before pack)
+playwright-browsers/
+
+# Environment and secrets
+.env
+.env.*
+
+# Runtime / local data
+billing_requests.json
+off.json
+store .json
+
+# Build output
+dist/
+dist2/
+dist-build-*/
+build-*/
+release/
+
+# IDE and OS
+.idea/
+.cursor/
+.DS_Store
