@@ -32,7 +32,13 @@
     /** Auth/login page. User enters email here, then clicks Next -> /login. */
     login: 'https://app.auth.uniteus.io/',
     /** Hit this before login to clear any existing Unite session. */
-    logout: 'https://app.uniteus.io/logout'
+    logout: 'https://app.uniteus.io/logout',
+    /**
+     * Facesheet profile (insurance verify). Build as:
+     * `https://app.uniteus.io/facesheet/{contactId}/profile`
+     * Contact id comes from case URL `/contact/{uuid}`.
+     */
+    facesheetProfile: 'https://app.uniteus.io/facesheet'
   },
 
   // ---------------------------------------------------------------------------
@@ -151,7 +157,9 @@
       /** data-test-element for amount shown on card. */
       amountDataTest: 'unit-amount-value',
       /** data-test-element for date range; alternate if they use start-only. */
-      datesDataTest: ['service-dates-value', 'service-start-date-value']
+      datesDataTest: ['service-dates-value', 'service-start-date-value'],
+      /** Card header row (date + Invoice # link + status text e.g. Submitted / Transmitted to Payer). */
+      invoiceHeaderRowClass: 'mt-2 flex space-x-2'
     },
 
     // ----- Period of Service (Single Date vs Date Range) ---------------------
@@ -305,6 +313,18 @@
         id: 'household_member_cin_s',
         xpath: '/html/body/div[2]/div[2]/main/div/section/div/div[2]/div/div[1]/div[2]/div[2]/div[2]/div/form/div[5]/div[5]/div/textarea'
       }
+    },
+
+    /** Number of meals covered (MTM / non-produce forms). */
+    meals: {
+      id: 'unit_amount_display',
+      name: 'provided_service.metadata[4].value'
+    },
+
+    /** Number of weeks covered (Produce forms; always 1). */
+    weeks: {
+      id: 'unit_amount_display',
+      name: 'provided_service.metadata[1].value'
     },
 
     // ----- Submit ------------------------------------------------------------

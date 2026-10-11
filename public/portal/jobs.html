@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jobs — Diet Fantasy</title>
+    <link rel="icon" href="/logo.png" type="image/png">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="portal-page">
+        <div class="portal-top">
+            <div>
+                <img src="/logo.png" width="40" height="40" alt="">
+                <strong>Diet Fantasy</strong>
+            </div>
+            <div>
+                <span id="who" class="job-row__meta"></span>
+                <a href="/users" id="users-link" hidden>Users</a>
+                <button type="button" id="logout" class="btn btn-outline btn-compact">Log out</button>
+            </div>
+        </div>
+        <div class="portal-card">
+            <h1>Jobs</h1>
+            <p class="lead">Each job is its own run. Open two jobs in two browser tabs to watch them at the same time. The server cap is <span id="cap">2 jobs</span>, <span id="browser-cap">8 browsers</span> each.</p>
+            <form id="new-job" class="portal-form">
+                <label>New workspace name
+                    <input id="job-name" placeholder="Monday billing" required>
+                </label>
+                <button type="submit" class="btn btn-primary">Start a workspace</button>
+            </form>
+            <p id="error" class="portal-error"></p>
+            <div id="list" class="job-list"></div>
+        </div>
+    </div>
+    <script>
+        const listEl = document.getElementById('list');
+        const errorEl = document.getElementById('error');
+
+        function statusClass(status) {
+            return 'job-status job-status--' + (status || 'idle');
+        }
+
+        function render(jobs) {
+            listEl.innerHTML = '';
+            if (!jobs.length) {
+                listEl.innerHTML = '<p class="job-row__meta">No jobs yet. Create a workspace, then download a client list inside it.</p>';
+                return;
+            }
+            for (const job of jobs) {
+                const row = document.createElement('div');
+                row.className = 'job-row';
+                const progress = job.total ? (job.done + ' / ' + job.total + ' done') : 'No clients yet';
+                const kind = job.runType === 'insurance' ? 'Insurance' : (job.runType === 'billing' ? 'Billing' : 'Workspace');
+                row.innerHTML =
+                    '<div><strong></strong> <span class="' + statusClass(job.status) + '"></span>' +
+                    '<div class="job-row__meta"></div></div>' +
+                    '<div><a class="btn btn-primary btn-compact">Open</a> ' +
+                    '<button type="button" class="btn btn-outline btn-compact">Delete</button></div>';
+                row.querySelector('strong').textContent = job.name;
+                row.querySelector('.job-status').textContent = job.status;
+                row.querySelector('.job-row__meta').textContent =
+                    kind + ' · ' + progress +
+                    (job.account ? ' · ' + job.account : '') +
+                    (job.startedBy ? ' · started by ' + job.startedBy : '') +
+                    (job.createdBy ? ' · created by ' + job.createdBy : '');
+                const open = row.querySelector('a');
+                open.href = '/?job=' + encodeURIComponent(job.id);
+                open.target = '_blank';
+                const del = row.querySelector('button');
+                del.disabled = job.status === 'running';
+                del.addEventListener('click', async () => {
+                    if (!confirm('Delete “' + job.name + '”?')) return;
+                    const r = await fetch('/api/jobs/' + job.id, { method: 'DELETE' });
+                    const data = await r.json().catch(() => ({}));
+                    if (!r.ok) {
+                        errorEl.textContent = data.error || 'Delete failed';
+                        return;
+                    }
+                    load();
+                });
+                listEl.appendChild(row);
+            }
+        }
+
+        async function load() {
+            const r = await fetch('/api/jobs');
+            if (r.status === 401) {
+                location.href = '/login';
+                return;
+            }
+            const data = await r.json();
+            if (data.caps) {
+                document.getElementById('cap').textContent = data.caps.maxJobs + ' jobs';
+                document.getElementById('browser-cap').textContent = data.caps.maxBrowsers + ' browsers';
+            }
+            render(data.jobs || []);
+        }
+
+        fetch('/api/auth/me').then((r) => r.json()).then((d) => {
+            if (!d.user) {
+                location.href = '/login';
+                return;
+            }
+            document.getElementById('who').textContent = d.user.email;
+            if (d.user.role === 'admin') document.getElementById('users-link').hidden = false;
+        });
+
+        document.getElementById('new-job').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            errorEl.textContent = '';
+            const name = document.getElementById('job-name').value.trim();
+            const r = await fetch('/api/jobs', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                errorEl.textContent = data.error || 'Could not create job';
+                return;
+            }
+            location.href = '/?job=' + encodeURIComponent(data.job.id);
+        });
+
+        document.getElementById('logout').addEventListener('click', () => {
+            fetch('/api/auth/logout', { method: 'POST' }).finally(() => { location.href = '/login'; });
+        });
+
+        load();
+        setInterval(load, 4000);
+    </script>
+</body>
+</html>

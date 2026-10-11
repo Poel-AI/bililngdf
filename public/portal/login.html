@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in — Diet Fantasy</title>
+    <link rel="icon" href="/logo.png" type="image/png">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="portal-page">
+        <div class="portal-card">
+            <img src="/logo.png" width="48" height="48" alt="">
+            <h1>Diet Fantasy</h1>
+            <p class="lead" id="lead">Sign in to run billing and insurance jobs on the server.</p>
+            <form id="login-form" class="portal-form">
+                <label>Email
+                    <input id="email" type="email" autocomplete="username" required>
+                </label>
+                <label>Password
+                    <input id="password" type="password" autocomplete="current-password" required>
+                </label>
+                <p id="error" class="portal-error" role="alert"></p>
+                <button type="submit" class="btn btn-primary" id="submit">Sign in</button>
+            </form>
+        </div>
+    </div>
+    <script>
+        const form = document.getElementById('login-form');
+        const errorEl = document.getElementById('error');
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            errorEl.textContent = '';
+            const r = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    email: document.getElementById('email').value.trim(),
+                    password: document.getElementById('password').value,
+                }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                errorEl.textContent = data.error || 'Sign in failed.';
+                return;
+            }
+            location.href = '/jobs';
+        });
+    </script>
+</body>
+</html>

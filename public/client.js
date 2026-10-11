@@ -1,3 +1,31 @@
+(function () {
+    const params = new URLSearchParams(location.search);
+    const jobId = params.get('job');
+    if (!jobId || !/^[a-f0-9]{16}$/.test(jobId)) return;
+    window.__PORTAL_JOB_ID = jobId;
+    const prefix = '/api/jobs/' + jobId;
+    const origFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        let url = input;
+        if (typeof input === 'string' && input.startsWith('/') && !input.startsWith('/api/jobs/') && !input.startsWith('/api/auth/')) {
+            url = prefix + input;
+        }
+        return origFetch(url, init).then((res) => {
+            if (res.status === 401 && !String(url).includes('/api/auth/')) {
+                location.href = '/login';
+            }
+            return res;
+        });
+    };
+    const OrigES = window.EventSource;
+    window.EventSource = function (url, opts) {
+        if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('/api/jobs/')) {
+            url = prefix + url;
+        }
+        return new OrigES(url, opts);
+    };
+})();
+
 const termEl = document.getElementById('terminal');
 const queueBody = document.getElementById('queue-body');
 const statusBadge = document.getElementById('connection-status');
@@ -17,6 +45,34 @@ function escapeHtmlAttr(s) {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;')
         .replace(/</g, '&lt;');
+}
+
+/** true when this build is insurance-verification only (no billing). */
+let insuranceOnlyMode = false;
+
+function applyAppMode(s) {
+    insuranceOnlyMode = !!(s && (s.insuranceOnly === true || s.appMode === 'insurance'));
+    document.body.classList.toggle('app-mode-insurance', insuranceOnlyMode);
+    document.body.classList.toggle('app-mode-billing', !insuranceOnlyMode);
+    const title = (s && s.appDisplayName) || (insuranceOnlyMode ? 'Diet Fantasy Insurance' : 'Diet Fantasy Billing');
+    document.title = title;
+    const brandTitle = document.getElementById('brand-title');
+    if (brandTitle) brandTitle.textContent = title;
+    const tagline = document.getElementById('brand-tagline');
+    if (tagline) {
+        tagline.textContent = insuranceOnlyMode
+            ? 'Load your client list, then verify insurance. Activity and progress appear below.'
+            : 'Load your client list, then run billing. Activity and progress appear below.';
+    }
+    const resumeBtn = document.getElementById('btn-resume-session');
+    if (resumeBtn) {
+        resumeBtn.textContent = insuranceOnlyMode ? 'Resume check' : 'Resume billing';
+    }
+    const insuranceBtn = document.getElementById('btn-check-insurance');
+    if (insuranceBtn) {
+        insuranceBtn.classList.toggle('btn-primary', insuranceOnlyMode);
+        insuranceBtn.classList.toggle('btn-secondary', !insuranceOnlyMode);
+    }
 }
 
 /** First case UUID in a Unite URL (`.../cases/open/{uuid}/...`). */
@@ -42,6 +98,8 @@ function collectProofUrls(req) {
     };
     if (Array.isArray(req.proofURLs)) req.proofURLs.forEach(add);
     add(req.proofURL);
+    add(req.mealInvoice);
+    add(req.produceInvoice);
     return out;
 }
 
@@ -94,6 +152,115 @@ function proofLinksCell(req) {
     return `<span class="col-links">${parts.join('<span class="queue-link-sep"> · </span>')}</span>`;
 }
 
+function parseClientIdFromProofUrl(raw) {
+    const t = String(raw || '').trim();
+    if (!t) return '';
+    let resolved = t;
+    if (!/^https?:\/\//i.test(t)) {
+        const base = API_BASE_URL.replace(/\/$/, '');
+        resolved = t.startsWith('/') ? `${base}${t}` : `${base}/${t}`;
+    }
+    if (!/client-invoice-pdf/i.test(resolved)) return '';
+    try {
+        return new URL(resolved).searchParams.get('clientId') || '';
+    } catch {
+        return '';
+    }
+}
+
+function resolveClientIdForReq(req) {
+    const urls = collectProofUrls(req);
+    const fromProof = parseClientIdFromProofUrl(urls[0] || '');
+    if (fromProof) return fromProof;
+    if (req.clientId != null && String(req.clientId).trim() !== '') return String(req.clientId).trim();
+    return '';
+}
+
+function billingWeekEndIsoFromStart(start) {
+    if (!start || !/^\d{4}-\d{2}-\d{2}$/.test(String(start))) return '';
+    const [y, m, d] = String(start).split('-').map(Number);
+    const end = new Date(Date.UTC(y, m - 1, d));
+    end.setUTCDate(end.getUTCDate() + 6);
+    return end.toISOString().slice(0, 10);
+}
+
+function syncBillEndDateFromStart() {
+    const endEl = document.getElementById('bill-end-date');
+    if (!endEl) return;
+    endEl.value = billingWeekEndIsoFromStart(getBillDate());
+}
+
+function syncCustomEndDateDefaults() {
+    const endEl = document.getElementById('bill-end-date');
+    if (!endEl) return;
+    if (!endEl.value) {
+        endEl.value = billingWeekEndIsoFromStart(getBillDate());
+    }
+}
+
+function getBillEndDate() {
+    const el = document.getElementById('bill-end-date');
+    return (el && el.value) ? el.value.trim() : '';
+}
+
+function isCustomInvoicesOn() {
+    const btn = document.getElementById('btn-custom-invoice');
+    return btn ? btn.classList.contains('btn-toggle--on') : false;
+}
+
+function getCustomInvoiceParamsFromForm() {
+    const from = getBillDate();
+    const to = getBillEndDate() || billingWeekEndIsoFromStart(from);
+    const itemName = (document.getElementById('ci-item-name')?.value || '').trim();
+    const quantity = (document.getElementById('ci-quantity')?.value || '').trim();
+    const unitPrice = (document.getElementById('ci-unit-price')?.value || '').trim();
+    return { from, to, itemName, quantity, unitPrice };
+}
+
+function validateBillEndDateFields() {
+    const start = getBillDate();
+    const end = getBillEndDate();
+    if (!end || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return 'Set list end date (YYYY-MM-DD)';
+    if (start && end && end < start) return 'List end date must be on or after billing week start';
+    return null;
+}
+
+function validateCustomInvoiceGlobalFields(params) {
+    if (!isCustomInvoicesOn()) return null;
+    const endErr = validateBillEndDateFields();
+    if (endErr) return endErr;
+    if (!params) return 'Custom invoice fields missing';
+    const missing = [];
+    if (!params.from || !/^\d{4}-\d{2}-\d{2}$/.test(params.from)) missing.push('from');
+    if (!params.to || !/^\d{4}-\d{2}-\d{2}$/.test(params.to)) missing.push('to');
+    if (!params.itemName) missing.push('item name');
+    if (!params.quantity) missing.push('quantity');
+    if (!params.unitPrice) missing.push('unit price');
+    if (missing.length) return `Fill custom invoice ${missing.join(', ')}`;
+    return null;
+}
+
+function setCustomInvoiceFieldsVisible(show) {
+    const toolbar = document.querySelector('section.toolbar');
+    if (toolbar) toolbar.classList.toggle('custom-invoice-mode', !!show);
+}
+
+function updateCustomInvoiceButtonUI(on) {
+    const btn = document.getElementById('btn-custom-invoice');
+    if (!btn) return;
+    if (on) {
+        btn.classList.add('btn-toggle--on');
+        btn.textContent = 'Custom invoice: On';
+        btn.setAttribute('aria-pressed', 'true');
+        setCustomInvoiceFieldsVisible(true);
+    } else {
+        btn.classList.remove('btn-toggle--on');
+        btn.textContent = 'Custom invoice: Off';
+        btn.setAttribute('aria-pressed', 'false');
+        setCustomInvoiceFieldsVisible(false);
+    }
+}
+
 let settingsUiLocked = false;
 
 function setSettingsFormDisabled(locked) {
@@ -105,11 +272,18 @@ function setSettingsFormDisabled(locked) {
         'btn-check-only-multi-debug',
         'btn-submit-invoice',
         'btn-upload-attestations',
+        'btn-skip-produce',
+        'btn-skip-food',
         'btn-bill-invoices-endpoint',
         'btn-save-settings',
         'btn-open-source-files',
         'check-only-dates-input',
-        'date-clamp-mode'
+        'date-clamp-mode',
+        'btn-custom-invoice',
+        'bill-end-date',
+        'ci-item-name',
+        'ci-quantity',
+        'ci-unit-price'
     ];
     ids.forEach((id) => {
         const el = document.getElementById(id);
@@ -131,6 +305,34 @@ function updateUploadAttestationsButtonUI(uploadOn) {
     }
 }
 
+function updateSkipProduceButtonUI(on) {
+    const btn = document.getElementById('btn-skip-produce');
+    if (!btn) return;
+    if (on) {
+        btn.classList.add('btn-toggle--on');
+        btn.textContent = 'Skip produce: On';
+        btn.setAttribute('aria-pressed', 'true');
+    } else {
+        btn.classList.remove('btn-toggle--on');
+        btn.textContent = 'Skip produce: Off';
+        btn.setAttribute('aria-pressed', 'false');
+    }
+}
+
+function updateSkipFoodButtonUI(on) {
+    const btn = document.getElementById('btn-skip-food');
+    if (!btn) return;
+    if (on) {
+        btn.classList.add('btn-toggle--on');
+        btn.textContent = 'Skip food: On';
+        btn.setAttribute('aria-pressed', 'true');
+    } else {
+        btn.classList.remove('btn-toggle--on');
+        btn.textContent = 'Skip food: Off';
+        btn.setAttribute('aria-pressed', 'false');
+    }
+}
+
 async function persistUploadAttestationsToggle(uploadOn) {
     try {
         const r = await fetch('/api/settings', {
@@ -144,6 +346,42 @@ async function persistUploadAttestationsToggle(uploadOn) {
             return;
         }
         log(uploadOn ? 'Proof upload enabled (saved to .env)' : 'Proof upload disabled (saved to .env)', 'success');
+    } catch (e) {
+        log(`Save failed: ${e.message}`, 'error');
+    }
+}
+
+async function persistSkipProduceToggle(on) {
+    try {
+        const r = await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ skipProduce: on })
+        });
+        const d = await r.json();
+        if (!r.ok) {
+            log(d.error || `Save failed (${r.status})`, 'error');
+            return;
+        }
+        log(on ? 'Skip produce enabled (saved to .env)' : 'Skip produce disabled (saved to .env)', 'success');
+    } catch (e) {
+        log(`Save failed: ${e.message}`, 'error');
+    }
+}
+
+async function persistSkipFoodToggle(on) {
+    try {
+        const r = await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ skipFood: on })
+        });
+        const d = await r.json();
+        if (!r.ok) {
+            log(d.error || `Save failed (${r.status})`, 'error');
+            return;
+        }
+        log(on ? 'Skip food enabled (saved to .env)' : 'Skip food disabled (saved to .env)', 'success');
     } catch (e) {
         log(`Save failed: ${e.message}`, 'error');
     }
@@ -386,6 +624,7 @@ async function loadSettings() {
             log(`Settings load failed: ${s.error || r.status}`, 'error');
             return;
         }
+        applyAppMode(s);
         const num = document.getElementById('setting-concurrent-browsers');
         if (num) {
             if (s.minConcurrent != null) num.min = String(s.minConcurrent);
@@ -394,6 +633,8 @@ async function loadSettings() {
         }
         updateShowBrowserButtonUI(!s.headless);
         updateUploadAttestationsButtonUI(s.uploadAttestations !== false);
+        updateSkipProduceButtonUI(s.skipProduce === true);
+        updateSkipFoodButtonUI(s.skipFood === true);
         updateCheckOnlyButtonUI(s.checkOnlyMode === true);
         updateCheckOnlyMultiDateDebugUI(s.checkOnlyMultiDateDebug === true);
         updateSubmitInvoiceButtonUI(s.submitInvoice !== false);
@@ -411,6 +652,7 @@ async function loadSettings() {
         setSettingsFormDisabled(s.isRunning);
         const c = Math.max(0, parseInt(s.concurrentBrowsers, 10) || 0);
         if (c > 0) renderSlotBoxes(c);
+        if (s.portalMode) applyPortalChrome(s);
     } catch (e) {
         log(`Settings load failed: ${e.message}`, 'error');
     }
@@ -485,21 +727,32 @@ async function exportExcel() {
     }
 }
 
-function readFileAsBase64(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-            const dataUrl = reader.result;
-            if (typeof dataUrl !== 'string') {
-                reject(new Error('Could not read file'));
-                return;
-            }
-            const comma = dataUrl.indexOf(',');
-            resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
-        };
-        reader.onerror = () => reject(reader.error || new Error('File read failed'));
-        reader.readAsDataURL(file);
-    });
+async function exportInsuranceExcel() {
+    try {
+        const r = await fetch('/api/export-insurance.xlsx');
+        if (!r.ok) {
+            let msg = `Insurance export failed (${r.status})`;
+            try {
+                const err = await r.json();
+                if (err.error) msg = err.error;
+            } catch (_) { /* not JSON */ }
+            log(msg, 'error');
+            return;
+        }
+        const blob = await r.blob();
+        const disp = r.headers.get('Content-Disposition') || '';
+        let name = 'insurance-verify.xlsx';
+        const m = /filename="([^"]+)"/.exec(disp);
+        if (m) name = m[1];
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        log(`Downloaded ${name}`, 'success');
+    } catch (e) {
+        log(`Insurance export failed: ${e.message}`, 'error');
+    }
 }
 
 async function importRemainingFromExcel(file) {
@@ -509,16 +762,34 @@ async function importRemainingFromExcel(file) {
         return;
     }
     try {
-        log(`Reading ${file.name}…`, 'info');
-        const fileBase64 = await readFileAsBase64(file);
+        log(`Uploading ${file.name} (${Math.max(1, Math.round(file.size / 1024))} KB)…`, 'info');
         const r = await fetch('/api/import-queue-from-excel', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ fileBase64, onlyRemaining: true }),
+            headers: {
+                'Content-Type':
+                    file.type ||
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'X-Only-Remaining': 'true',
+            },
+            body: file,
         });
-        const d = await r.json().catch(() => ({}));
+        const raw = await r.text();
+        let d = {};
+        try {
+            d = raw ? JSON.parse(raw) : {};
+        } catch (_) {
+            d = {};
+        }
         if (!r.ok) {
-            log(d.error || `Import failed (${r.status})`, 'error');
+            const sizeKb = Math.max(1, Math.round(file.size / 1024));
+            const msg =
+                d.error ||
+                (r.status === 413
+                    ? `Excel file is too large (${sizeKb} KB). Server limit is 25 MB.`
+                    : raw && raw.trim()
+                      ? raw.trim().slice(0, 200)
+                      : `Import failed (${r.status})`);
+            log(msg, 'error');
             if (Array.isArray(d.missing) && d.missing.length) {
                 log(`Unmatched rows: ${d.missing.slice(0, 5).join(', ')}${d.missing.length > 5 ? '…' : ''}`, 'warning');
             }
@@ -717,6 +988,33 @@ function loadBillingSession() {
         .catch((e) => log(`Load session failed: ${e.message}`, 'error'));
 }
 
+function postJson(url, body) {
+    const send = (payload) => fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    }).then(async (r) => {
+        const data = await r.json().catch(() => ({}));
+        if (r.status === 409 && data.code === 'SAME_ACCOUNT' && !payload.confirmSameAccount) {
+            const proceed = window.confirm(
+                (data.error || 'Another running job is already using this UniteUs login.') +
+                '\n\nStart this job anyway? The two runs can kick each other off UniteUs.'
+            );
+            if (!proceed) {
+                const err = new Error('Not started.');
+                err.silent = true;
+                throw err;
+            }
+            return send(Object.assign({}, payload, { confirmSameAccount: true }));
+        }
+        if (!r.ok || data.error) {
+            throw new Error(data.error || data.message || ('HTTP ' + r.status));
+        }
+        return data;
+    });
+    return send(body);
+}
+
 function resumeBillingSession() {
     log('Resuming saved billing session…', 'info');
     const account = getSelectedAccount();
@@ -724,17 +1022,28 @@ function resumeBillingSession() {
     const uploadAttestations = attBtn ? attBtn.classList.contains('btn-toggle--on') : true;
     const checkBtn = document.getElementById('btn-check-only');
     const checkOnlyMode = checkBtn ? checkBtn.classList.contains('btn-toggle--on') : false;
-    fetch('/process-billing', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: 'resume', apiKey: '', account, uploadAttestations, checkOnlyMode }),
-    })
-        .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
-        .then(({ ok, d }) => {
-            if (!ok || d.error) throw new Error(d.error || 'Resume failed');
+    const skipProduceBtn = document.getElementById('btn-skip-produce');
+    const skipProduce = skipProduceBtn ? skipProduceBtn.classList.contains('btn-toggle--on') : false;
+    const skipFoodBtn = document.getElementById('btn-skip-food');
+    const skipFood = skipFoodBtn ? skipFoodBtn.classList.contains('btn-toggle--on') : false;
+    const payload = {
+        source: 'resume',
+        apiKey: '',
+        account,
+        uploadAttestations,
+        checkOnlyMode,
+        skipProduce,
+        skipFood,
+        customInvoices: isCustomInvoicesOn(),
+        customInvoiceParams: isCustomInvoicesOn() ? getCustomInvoiceParamsFromForm() : undefined
+    };
+    postJson('/process-billing', payload)
+        .then((d) => {
             log(d.message || 'Resume started.', 'success');
         })
-        .catch((e) => log(`Resume failed: ${e.message}`, 'error'));
+        .catch((e) => {
+            if (!e.silent) log(`Resume failed: ${e.message}`, 'error');
+        });
 }
 
 function dismissBillingSession() {
@@ -808,6 +1117,38 @@ function applyUnselectedPendingAsSkipped() {
     });
 }
 
+function formatCheckOnlyInvoicesCell(req) {
+    const v = req.checkOnlyInvoiceAmounts != null ? String(req.checkOnlyInvoiceAmounts).trim() : '';
+    if (v) return v;
+    const list = Array.isArray(req.checkOnlyInvoices) ? req.checkOnlyInvoices : [];
+    if (list.length === 0) return '—';
+    return list.map((inv) => inv.amount || '—').join(', ');
+}
+
+function formatInsuranceResultsCellHtml(req) {
+    const list = Array.isArray(req.insuranceResults) ? req.insuranceResults : [];
+    if (list.length === 0) {
+        if (req.status === 'processing' && /verifying insurance/i.test(String(req.message || ''))) {
+            return '<span class="td-muted">Checking…</span>';
+        }
+        return '<span class="td-muted">—</span>';
+    }
+    return list
+        .map((r) => {
+            const st = String(r.status || '').toUpperCase();
+            let cls = 'ins-badge';
+            if (st === 'GREEN') cls += ' ins-badge--green';
+            else if (st === 'RED') cls += ' ins-badge--red';
+            else cls += ' ins-badge--err';
+            const title = escapeHtmlAttr(
+                `${r.plan || '?'}: ${st}${r.detail ? ` — ${r.detail}` : ''}`
+            );
+            const label = escapeHtml(`${r.plan || '?'}: ${st}`);
+            return `<span class="${cls}" title="${title}">${label}</span>`;
+        })
+        .join(' ');
+}
+
 function normalizedRowStatus(req) {
     return String(req.status || 'pending').toLowerCase();
 }
@@ -818,6 +1159,7 @@ function rowSearchHaystack(req) {
         req.id,
         req.orderID,
         req.clientId,
+        req.clientType,
         req.date,
         req.start,
         req.end,
@@ -830,6 +1172,12 @@ function rowSearchHaystack(req) {
         uniteCaseIdFromUrl(req.url),
         req.status,
         req.checkOnlyInvoiceAmounts,
+        Array.isArray(req.checkOnlyInvoices)
+            ? req.checkOnlyInvoices.map((i) => i.status).join(' ')
+            : '',
+        Array.isArray(req.insuranceResults)
+            ? req.insuranceResults.map((i) => `${i.plan} ${i.status} ${i.detail}`).join(' ')
+            : '',
         req.message,
         Array.isArray(req.orderNumbers) ? req.orderNumbers.join(' ') : ''
     ];
@@ -898,6 +1246,18 @@ function sortQueue(field) {
             return 0;
         }
 
+        if (field === 'insuranceResults') {
+            const sa = Array.isArray(a.insuranceResults)
+                ? a.insuranceResults.map((r) => `${r.plan}:${r.status}`).join(' ')
+                : '';
+            const sb = Array.isArray(b.insuranceResults)
+                ? b.insuranceResults.map((r) => `${r.plan}:${r.status}`).join(' ')
+                : '';
+            if (sa < sb) return -1 * dir;
+            if (sa > sb) return 1 * dir;
+            return 0;
+        }
+
         let valA =
             field === 'start'
                 ? (a.start || a.date || '')
@@ -936,11 +1296,15 @@ function normalizeCustomerApiUrl(urlStr) {
 /** Maps Account dropdown to ?account= for /api/bill and /api/bill/invoices (Main = regular). */
 function billAccountFromServerSelect(sel) {
     const v = (sel && sel.value) || 'main';
-    return v === 'brooklyn' ? 'brooklyn' : 'regular';
+    if (v === 'brooklyn') return 'brooklyn';
+    if (v === 'yonkers') return 'yonkers';
+    return 'regular';
 }
 
 function billAccountLabel(account) {
-    return account === 'brooklyn' ? 'Brooklyn' : 'Diet Fantasy (Main)';
+    if (account === 'brooklyn') return 'Brooklyn';
+    if (account === 'yonkers') return 'Yonkers';
+    return 'Diet Fantasy (Main)';
 }
 
 function getSelectedAccount() {
@@ -975,7 +1339,14 @@ function downloadAllClients() {
     const date = getBillDate();
     const account = getSelectedAccount();
     const label = billAccountLabel(account);
-    log(`Fetching ${label} client list for week starting ${date}…`, 'info');
+    const endErr = validateBillEndDateFields();
+    if (endErr) {
+        log(endErr, 'error');
+        return;
+    }
+    const endDate = getBillEndDate();
+    const rangeLabel = `${date} → ${endDate}`;
+    log(`Fetching ${label} client list for ${rangeLabel}…`, 'info');
 
     requestsSnapshotBeforeDownload = lastRequests.slice();
     queueDownloadLoading = true;
@@ -985,10 +1356,12 @@ function downloadAllClients() {
     updateStats([]);
     updateSelectAllCheckbox();
 
+    const payload = { date, account, endDate };
+
     fetch('/fetch-all-clients', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ date, account })
+        body: JSON.stringify(payload)
     })
         .then(r => r.json())
         .then(d => {
@@ -1027,6 +1400,10 @@ function countSelectedNeedsProcessing(requests) {
 }
 
 function runCurrentQueue() {
+    if (insuranceOnlyMode) {
+        log('Billing is disabled in this app. Use Check insurance.', 'warning');
+        return;
+    }
     const ids = [...selectedIds];
     if (ids.length === 0) {
         log('No clients selected. Check the clients you want to run.', 'warning');
@@ -1049,34 +1426,89 @@ function runCurrentQueue() {
     const datesStr = datesInput && datesInput.value ? datesInput.value.trim() : '';
     const submitBtn = document.getElementById('btn-submit-invoice');
     const submitInvoice = submitBtn ? submitBtn.classList.contains('btn-toggle--on') : true;
+    const skipProduceBtn = document.getElementById('btn-skip-produce');
+    const skipProduce = skipProduceBtn ? skipProduceBtn.classList.contains('btn-toggle--on') : false;
+    const skipFoodBtn = document.getElementById('btn-skip-food');
+    const skipFood = skipFoodBtn ? skipFoodBtn.classList.contains('btn-toggle--on') : false;
     const clampSel = document.getElementById('date-clamp-mode');
     const dateClampMode =
         clampSel && clampSel.value === 'client_created' ? 'client_created' : 'auth';
     const account = getSelectedAccount();
-    const body = { source: 'queue', apiKey: '', account, uploadAttestations, checkOnlyMode, submitInvoice, dateClampMode };
+    const customInvoices = isCustomInvoicesOn();
+    const customInvoiceParams = customInvoices ? getCustomInvoiceParamsFromForm() : null;
+    if (customInvoices) {
+        const fieldErr = validateCustomInvoiceGlobalFields(customInvoiceParams);
+        if (fieldErr) {
+            log(fieldErr, 'error');
+            return;
+        }
+        const selected = lastRequests.filter((r) => selectedIds.has(requestIdForReq(r)));
+        for (const r of selected) {
+            const clientId = resolveClientIdForReq(r);
+            if (!clientId) {
+                log(`${r.name || 'Client'}: could not parse clientId from API proof link.`, 'error');
+                return;
+            }
+        }
+    }
+    const body = {
+        source: 'queue',
+        apiKey: '',
+        account,
+        uploadAttestations,
+        checkOnlyMode,
+        submitInvoice,
+        skipProduce,
+        skipFood,
+        dateClampMode,
+        customInvoices,
+        customInvoiceParams: customInvoices ? customInvoiceParams : undefined
+    };
     if (checkOnlyMode && multiDateOn && datesStr) {
         body.checkOnlyDebugDates = datesStr;
     }
     body.selectedIds = ids;
 
-    fetch('/process-billing', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    })
-        .then(r => {
-            if (!r.ok) {
-                return r.json().then(data => {
-                    throw new Error(data.error || `HTTP ${r.status}`);
-                });
-            }
-            return r.json();
-        })
+    postJson('/process-billing', body)
         .then(d => {
             log(d.message || 'Run started.', 'success');
         })
         .catch(e => {
-            log(`Error: ${e.message}`, 'error');
+            if (!e.silent) log(`Error: ${e.message}`, 'error');
+        });
+}
+
+/** Same selected queue, but open facesheet profile and Verify Insurance (no billing). */
+function runInsuranceCheck() {
+    const ids = [...selectedIds];
+    if (ids.length === 0) {
+        log('No clients selected. Check the clients you want to verify.', 'warning');
+        return;
+    }
+    const selected = lastRequests.filter((r) => selectedIds.has(requestIdForReq(r)));
+    if (selected.length === 0) {
+        log('No selected clients to check.', 'warning');
+        return;
+    }
+    const missingUrl = selected.filter((r) => !r.url || !String(r.url).includes('/contact/'));
+    if (missingUrl.length > 0) {
+        log(
+            `${missingUrl.length} selected client(s) missing a Unite /contact/… link (e.g. ${missingUrl[0].name || 'client'}).`,
+            'warning'
+        );
+    }
+    log(`Starting insurance check for ${selected.length} selected client(s)...`, 'info');
+
+    postJson('/process-insurance', {
+        account: getSelectedAccount(),
+        apiKey: '',
+        selectedIds: ids,
+    })
+        .then((d) => {
+            log(d.message || 'Insurance check started.', 'success');
+        })
+        .catch((e) => {
+            if (!e.silent) log(`Error: ${e.message}`, 'error');
         });
 }
 
@@ -1219,16 +1651,16 @@ function renderQueueSkeleton() {
         allCb.disabled = true;
     }
     const widths = [
-        [35, 42, 55, 48, 38, 32, 28, 40, 36, 50],
-        [40, 55, 48, 62, 44, 36, 34, 42, 40, 45],
-        [32, 48, 52, 55, 40, 30, 36, 38, 38, 55],
-        [45, 38, 58, 50, 42, 34, 32, 44, 42, 48],
-        [38, 52, 45, 58, 36, 38, 30, 40, 36, 52],
-        [42, 44, 50, 52, 40, 32, 36, 42, 40, 46],
-        [36, 50, 46, 54, 38, 36, 34, 40, 38, 50],
-        [44, 40, 54, 48, 42, 30, 32, 42, 44, 48],
-        [40, 46, 48, 56, 40, 34, 36, 44, 40, 52],
-        [38, 54, 52, 50, 44, 32, 28, 38, 36, 46]
+        [35, 42, 28, 55, 48, 38, 32, 28, 40, 36, 50, 48],
+        [40, 55, 32, 48, 62, 44, 36, 34, 42, 40, 45, 50],
+        [32, 48, 30, 52, 55, 40, 30, 36, 38, 38, 55, 48],
+        [45, 38, 34, 58, 50, 42, 34, 32, 44, 42, 48, 52],
+        [38, 52, 28, 45, 58, 36, 38, 30, 40, 36, 52, 46],
+        [42, 44, 32, 50, 52, 40, 32, 36, 42, 40, 46, 50],
+        [36, 50, 30, 46, 54, 38, 36, 34, 40, 38, 50, 44],
+        [44, 40, 28, 54, 48, 42, 30, 32, 42, 44, 48, 52],
+        [40, 46, 34, 48, 56, 40, 34, 36, 44, 40, 52, 48],
+        [38, 54, 32, 52, 50, 44, 32, 28, 38, 36, 46, 50]
     ];
     for (let i = 0; i < QUEUE_SKELETON_ROW_COUNT; i++) {
         const w = widths[i % widths.length];
@@ -1248,6 +1680,8 @@ function renderQueueSkeleton() {
             <td>${skeletonBar(w[7])}</td>
             <td>${skeletonBar(w[8])}</td>
             <td>${skeletonBar(w[9])}</td>
+            <td>${skeletonBar(w[10])}</td>
+            <td>${skeletonBar(w[11] || w[10])}</td>
         `;
         queueBody.appendChild(tr);
     }
@@ -1287,12 +1721,14 @@ function renderQueue() {
             <td class="col-check"><input type="checkbox" class="queue-row-check"${checked}></td>
             <td>${rowNum} <span class="td-muted">(${escapeHtml(String(req.orderID || req.id || '—'))})</span></td>
             <td class="queue-client-cell" tabindex="0" title="Click to toggle. Shift+click another row to select everyone in between.">${escapeHtml(req.name || '')}</td>
+            <td class="col-client-type">${escapeHtml(req.clientType != null && String(req.clientType).trim() !== '' ? String(req.clientType) : '—')}</td>
             <td>${escapeHtml(req.start ? `${req.start} → ${req.end}` : req.date || '—')}</td>
             <td class="col-created">${formatCreatedCell(req)}</td>
             <td class="col-links">${uniteCaseLinkCell(req)}</td>
-            <td class="col-links">${proofLinksCell(req)}</td>
+            <td class="col-links billing-only">${proofLinksCell(req)}</td>
             <td><span class="status-badge ${statusClass}">${escapeHtml(req.status || 'pending')}</span></td>
-            <td class="td-muted col-invoice-cost">${escapeHtml(req.checkOnlyInvoiceAmounts != null && String(req.checkOnlyInvoiceAmounts).trim() !== '' ? req.checkOnlyInvoiceAmounts : '—')}</td>
+            <td class="td-muted col-invoice-cost billing-only">${escapeHtml(formatCheckOnlyInvoicesCell(req))}</td>
+            <td class="col-insurance">${formatInsuranceResultsCellHtml(req)}</td>
             <td class="td-muted">${escapeHtml(req.message || '—')}</td>
         `;
         const cb = tr.querySelector('.queue-row-check');
@@ -1364,7 +1800,10 @@ setupQueueRowInteractions();
     const billInvoicesBtn = document.getElementById('btn-bill-invoices-endpoint');
     const datesInputEl = document.getElementById('check-only-dates-input');
     const attestBtn = document.getElementById('btn-upload-attestations');
+    const skipProduceBtn = document.getElementById('btn-skip-produce');
+    const skipFoodBtn = document.getElementById('btn-skip-food');
     const exportBtn = document.getElementById('btn-export-excel');
+    const exportInsuranceBtn = document.getElementById('btn-export-insurance-excel');
     if (saveBtn) saveBtn.addEventListener('click', () => saveSettings());
     if (openBtn) openBtn.addEventListener('click', () => openEnvFolder());
     if (showBtn) {
@@ -1409,6 +1848,20 @@ setupQueueRowInteractions();
             await persistBillFromInvoicesToggle(next);
         });
     }
+    const customInvoicesBtn = document.getElementById('btn-custom-invoice');
+    if (customInvoicesBtn) {
+        customInvoicesBtn.addEventListener('click', () => {
+            if (settingsUiLocked) return;
+            const next = !customInvoicesBtn.classList.contains('btn-toggle--on');
+            updateCustomInvoiceButtonUI(next);
+        });
+    }
+    const billDateEl = document.getElementById('bill-date');
+    if (billDateEl) {
+        billDateEl.addEventListener('change', () => {
+            syncBillEndDateFromStart();
+        });
+    }
     if (datesInputEl) {
         datesInputEl.addEventListener('change', async () => {
             if (settingsUiLocked) return;
@@ -1423,7 +1876,24 @@ setupQueueRowInteractions();
             await persistUploadAttestationsToggle(next);
         });
     }
+    if (skipProduceBtn) {
+        skipProduceBtn.addEventListener('click', async () => {
+            if (settingsUiLocked) return;
+            const next = !skipProduceBtn.classList.contains('btn-toggle--on');
+            updateSkipProduceButtonUI(next);
+            await persistSkipProduceToggle(next);
+        });
+    }
+    if (skipFoodBtn) {
+        skipFoodBtn.addEventListener('click', async () => {
+            if (settingsUiLocked) return;
+            const next = !skipFoodBtn.classList.contains('btn-toggle--on');
+            updateSkipFoodButtonUI(next);
+            await persistSkipFoodToggle(next);
+        });
+    }
     if (exportBtn) exportBtn.addEventListener('click', () => exportExcel());
+    if (exportInsuranceBtn) exportInsuranceBtn.addEventListener('click', () => exportInsuranceExcel());
     const importExcelBtn = document.getElementById('btn-import-excel-remaining');
     const importExcelFile = document.getElementById('import-excel-file');
     if (importExcelBtn && importExcelFile) {
@@ -1450,6 +1920,147 @@ setupQueueRowInteractions();
 })();
 
 initConnectionBadgeTripleClick();
+syncCustomEndDateDefaults();
+updateCustomInvoiceButtonUI(false);
 document.getElementById('btn-load-session')?.addEventListener('click', loadBillingSession);
 document.getElementById('btn-resume-session')?.addEventListener('click', resumeBillingSession);
 document.getElementById('btn-dismiss-session')?.addEventListener('click', dismissBillingSession);
+
+function applyPortalChrome() {
+    const bar = document.getElementById('portal-bar');
+    const live = document.getElementById('live-panel');
+    if (bar) bar.hidden = false;
+    if (live) live.hidden = false;
+    const showBrowser = document.getElementById('btn-show-browser');
+    if (showBrowser) showBrowser.hidden = true;
+    const openFiles = document.getElementById('btn-open-source-files');
+    if (openFiles) openFiles.hidden = true;
+    const nameEl = document.getElementById('portal-job-name');
+    if (nameEl) nameEl.textContent = 'This job';
+    fetch('/api/auth/me').then((r) => r.json()).then((d) => {
+        const user = d && d.user;
+        const el = document.getElementById('portal-user');
+        if (el && user) el.textContent = user.email || '';
+        const usersLink = document.getElementById('portal-users-link');
+        if (usersLink && user && user.role === 'admin') usersLink.hidden = false;
+    }).catch(() => {});
+    const stopBtn = document.getElementById('portal-stop');
+    if (stopBtn && !stopBtn.dataset.bound) {
+        stopBtn.dataset.bound = '1';
+        stopBtn.addEventListener('click', () => {
+            if (!window.confirm('Stop this job and close its browsers?')) return;
+            const id = window.__PORTAL_JOB_ID;
+            fetch('/api/jobs/' + id + '/stop', { method: 'POST' }).then(async (r) => {
+                const data = await r.json().catch(() => ({}));
+                if (!r.ok) log(data.error || 'Stop failed', 'error');
+                else log('Stop requested.', 'warning');
+            }).catch((e) => log(e.message, 'error'));
+        });
+    }
+    const logoutBtn = document.getElementById('portal-logout');
+    if (logoutBtn && !logoutBtn.dataset.bound) {
+        logoutBtn.dataset.bound = '1';
+        logoutBtn.addEventListener('click', () => {
+            fetch('/api/auth/logout', { method: 'POST' }).finally(() => { location.href = '/login'; });
+        });
+    }
+    startLiveView();
+}
+
+function imageFraction(img, clientX, clientY) {
+    const rect = img.getBoundingClientRect();
+    const nw = img.naturalWidth || rect.width;
+    const nh = img.naturalHeight || rect.height;
+    if (!nw || !nh) return null;
+    const scale = Math.min(rect.width / nw, rect.height / nh);
+    const dw = nw * scale;
+    const dh = nh * scale;
+    const ox = rect.left + (rect.width - dw) / 2;
+    const oy = rect.top + (rect.height - dh) / 2;
+    const x = (clientX - ox) / dw;
+    const y = (clientY - oy) / dh;
+    if (x < 0 || y < 0 || x > 1 || y > 1) return null;
+    return { x, y };
+}
+
+function startLiveView() {
+    if (!window.__PORTAL_JOB_ID || window.__liveViewStarted) return;
+    window.__liveViewStarted = true;
+    const grid = document.getElementById('live-grid');
+    const stageWrap = document.getElementById('live-stage-wrap');
+    const stage = document.getElementById('live-stage');
+    const stageImg = document.getElementById('live-stage-img');
+    if (!grid || !stageImg) return;
+    const thumbs = new Map();
+    let focus = '0';
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(proto + '//' + location.host + '/api/jobs/' + window.__PORTAL_JOB_ID + '/live');
+
+    function send(msg) {
+        if (ws.readyState === 1) ws.send(JSON.stringify(msg));
+    }
+
+    function ensureThumb(slotId) {
+        let img = thumbs.get(slotId);
+        if (img) return img;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'live-thumb';
+        btn.dataset.slot = slotId;
+        btn.innerHTML = '<span class="live-thumb__label">Slot ' + slotId + '</span>';
+        img = document.createElement('img');
+        img.alt = 'Slot ' + slotId;
+        img.draggable = false;
+        btn.appendChild(img);
+        btn.addEventListener('click', () => {
+            focus = slotId;
+            send({ type: 'focus', slotId });
+            stageWrap.hidden = false;
+            stage.focus();
+            for (const el of grid.querySelectorAll('.live-thumb')) {
+                el.classList.toggle('live-thumb--focus', el.dataset.slot === slotId);
+            }
+        });
+        grid.appendChild(btn);
+        thumbs.set(slotId, img);
+        if (thumbs.size === 1) btn.click();
+        return img;
+    }
+
+    ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        if (!msg || msg.type !== 'frame' || !msg.data) return;
+        const url = 'data:image/jpeg;base64,' + msg.data;
+        const thumb = ensureThumb(String(msg.slotId));
+        thumb.src = url;
+        if (String(msg.slotId) === focus) stageImg.src = url;
+    };
+
+    function pointerFraction(event) {
+        return imageFraction(stageImg, event.clientX, event.clientY);
+    }
+
+    stageImg.addEventListener('click', (event) => {
+        const pos = pointerFraction(event);
+        if (!pos) return;
+        stage.focus();
+        send({ type: 'input', kind: 'click', slotId: focus, x: pos.x, y: pos.y });
+    });
+    stageImg.addEventListener('wheel', (event) => {
+        const pos = pointerFraction(event);
+        if (!pos) return;
+        event.preventDefault();
+        send({ type: 'input', kind: 'wheel', slotId: focus, x: pos.x, y: pos.y, deltaY: event.deltaY });
+    }, { passive: false });
+    stage.addEventListener('keydown', (event) => {
+        if (event.metaKey || event.ctrlKey || event.altKey) return;
+        event.preventDefault();
+        if (event.key.length === 1) {
+            send({ type: 'input', kind: 'type', slotId: focus, text: event.key });
+        } else {
+            send({ type: 'input', kind: 'key', slotId: focus, key: event.key === ' ' ? 'Space' : event.key });
+        }
+    });
+}
+

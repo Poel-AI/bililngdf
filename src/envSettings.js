@@ -13,10 +13,17 @@ const DEFAULT_DATE_CLAMP_MODE = 'auth';
 const VALID_DATE_CLAMP_MODES = new Set(['auth', 'client_created']);
 /** When true (default), "Download client list" uses GET /api/bill/invoices?date=… instead of /api/bill. */
 const DEFAULT_BILL_FROM_INVOICES = true;
+/** When true, proof PDFs use /api/client-invoice-pdf with per-client params (clientId from API link; rest edited in queue). */
+const DEFAULT_CUSTOM_INVOICES = false;
+/** When true, skip billing clients whose Unite Service Type contains "produce". */
+const DEFAULT_SKIP_PRODUCE = false;
+/** When true, skip billing clients whose Unite Service Type is not produce (MTM / food). */
+const DEFAULT_SKIP_FOOD = false;
 const MIN_CONCURRENT = 1;
 const MAX_CONCURRENT = 50;
 
-function getEnvFilePath() {
+function getEnvFilePath(overridePath) {
+    if (overridePath) return overridePath;
     return process.env.DOTENV_PATH || path.join(__dirname, '..', '.env');
 }
 
@@ -27,8 +34,8 @@ function parseEnvLine(key, content) {
     return m[1].replace(/^["']|["']$/g, '').trim();
 }
 
-function readSettings() {
-    const envFilePath = getEnvFilePath();
+function readSettings(overridePath) {
+    const envFilePath = getEnvFilePath(overridePath);
     const envDir = path.dirname(envFilePath);
     let concurrentBrowsers = DEFAULT_CONCURRENT;
     let headless = DEFAULT_HEADLESS;
@@ -39,6 +46,9 @@ function readSettings() {
     let submitInvoice = DEFAULT_SUBMIT_INVOICE;
     let dateClampMode = DEFAULT_DATE_CLAMP_MODE;
     let billFromInvoices = DEFAULT_BILL_FROM_INVOICES;
+    let customInvoices = DEFAULT_CUSTOM_INVOICES;
+    let skipProduce = DEFAULT_SKIP_PRODUCE;
+    let skipFood = DEFAULT_SKIP_FOOD;
 
     let fromFile = false;
     if (fs.existsSync(envFilePath)) {
@@ -90,6 +100,18 @@ function readSettings() {
             if (bfi != null && bfi !== '') {
                 billFromInvoices = /^true$/i.test(bfi);
             }
+            const ci = parseEnvLine('CUSTOM_INVOICES', content);
+            if (ci != null && ci !== '') {
+                customInvoices = /^true$/i.test(ci);
+            }
+            const sp = parseEnvLine('SKIP_PRODUCE', content);
+            if (sp != null && sp !== '') {
+                skipProduce = /^true$/i.test(sp);
+            }
+            const sf = parseEnvLine('SKIP_FOOD', content);
+            if (sf != null && sf !== '') {
+                skipFood = /^true$/i.test(sf);
+            }
         }
     }
     if (!fromFile) {
@@ -122,6 +144,15 @@ function readSettings() {
         if (process.env.BILL_FROM_INVOICES != null && process.env.BILL_FROM_INVOICES !== '') {
             billFromInvoices = /^true$/i.test(String(process.env.BILL_FROM_INVOICES));
         }
+        if (process.env.CUSTOM_INVOICES != null && process.env.CUSTOM_INVOICES !== '') {
+            customInvoices = /^true$/i.test(String(process.env.CUSTOM_INVOICES));
+        }
+        if (process.env.SKIP_PRODUCE != null && process.env.SKIP_PRODUCE !== '') {
+            skipProduce = /^true$/i.test(String(process.env.SKIP_PRODUCE));
+        }
+        if (process.env.SKIP_FOOD != null && process.env.SKIP_FOOD !== '') {
+            skipFood = /^true$/i.test(String(process.env.SKIP_FOOD));
+        }
     }
 
     return {
@@ -134,6 +165,9 @@ function readSettings() {
         submitInvoice,
         dateClampMode,
         billFromInvoices,
+        customInvoices,
+        skipProduce,
+        skipFood,
         envFilePath,
         envDir
     };
@@ -151,7 +185,7 @@ function applyToProcessEnv(concurrentBrowsers, headless, uploadAttestations, che
  * Preserves other lines; replaces existing keys or appends at end.
  * Only keys present on `updates` are written.
  */
-function writeSettings(updates) {
+function writeSettings(updates, overridePath) {
     if (
         updates.concurrentBrowsers == null &&
         updates.headless == null &&
@@ -161,18 +195,21 @@ function writeSettings(updates) {
         updates.checkOnlyDebugDates == null &&
         updates.submitInvoice == null &&
         updates.dateClampMode == null &&
-        updates.billFromInvoices == null
+        updates.billFromInvoices == null &&
+        updates.customInvoices == null &&
+        updates.skipProduce == null &&
+        updates.skipFood == null
     ) {
         throw new Error('No settings to update');
     }
 
-    const envFilePath = getEnvFilePath();
+    const envFilePath = getEnvFilePath(overridePath);
     const envDir = path.dirname(envFilePath);
     if (!fs.existsSync(envDir)) {
         fs.mkdirSync(envDir, { recursive: true });
     }
 
-    const current = readSettings();
+    const current = readSettings(overridePath);
     const nextConcurrent =
         updates.concurrentBrowsers != null
             ? Math.min(MAX_CONCURRENT, Math.max(MIN_CONCURRENT, parseInt(updates.concurrentBrowsers, 10) || MIN_CONCURRENT))
@@ -197,6 +234,12 @@ function writeSettings(updates) {
     }
     const nextBillFromInvoices =
         updates.billFromInvoices != null ? Boolean(updates.billFromInvoices) : current.billFromInvoices;
+    const nextCustomInvoices =
+        updates.customInvoices != null ? Boolean(updates.customInvoices) : current.customInvoices;
+    const nextSkipProduce =
+        updates.skipProduce != null ? Boolean(updates.skipProduce) : current.skipProduce;
+    const nextSkipFood =
+        updates.skipFood != null ? Boolean(updates.skipFood) : current.skipFood;
 
     let lines = [];
     if (fs.existsSync(envFilePath)) {
@@ -256,6 +299,15 @@ function writeSettings(updates) {
     if (updates.billFromInvoices != null) {
         setKey('BILL_FROM_INVOICES', nextBillFromInvoices ? 'true' : 'false');
     }
+    if (updates.customInvoices != null) {
+        setKey('CUSTOM_INVOICES', nextCustomInvoices ? 'true' : 'false');
+    }
+    if (updates.skipProduce != null) {
+        setKey('SKIP_PRODUCE', nextSkipProduce ? 'true' : 'false');
+    }
+    if (updates.skipFood != null) {
+        setKey('SKIP_FOOD', nextSkipFood ? 'true' : 'false');
+    }
 
     const body = lines.join('\n').replace(/\n+$/, '') + '\n';
     try {
@@ -268,6 +320,7 @@ function writeSettings(updates) {
         throw new Error(`Cannot save settings (${e.code || ''}): ${hint}`);
     }
 
+    if (!overridePath) {
     applyToProcessEnv(nextConcurrent, nextHeadless, nextUploadAttestations, nextCheckOnlyMode);
 
     if (updates.checkOnlyMultiDateDebug != null) {
@@ -285,6 +338,16 @@ function writeSettings(updates) {
     if (updates.billFromInvoices != null) {
         process.env.BILL_FROM_INVOICES = nextBillFromInvoices ? 'true' : 'false';
     }
+    if (updates.customInvoices != null) {
+        process.env.CUSTOM_INVOICES = nextCustomInvoices ? 'true' : 'false';
+    }
+    if (updates.skipProduce != null) {
+        process.env.SKIP_PRODUCE = nextSkipProduce ? 'true' : 'false';
+    }
+    if (updates.skipFood != null) {
+        process.env.SKIP_FOOD = nextSkipFood ? 'true' : 'false';
+    }
+    }
 
     return {
         concurrentBrowsers: nextConcurrent,
@@ -296,6 +359,9 @@ function writeSettings(updates) {
         submitInvoice: nextSubmitInvoice,
         dateClampMode: nextDateClampMode,
         billFromInvoices: nextBillFromInvoices,
+        customInvoices: nextCustomInvoices,
+        skipProduce: nextSkipProduce,
+        skipFood: nextSkipFood,
         envFilePath,
         envDir
     };
@@ -335,5 +401,8 @@ module.exports = {
     DEFAULT_SUBMIT_INVOICE,
     DEFAULT_DATE_CLAMP_MODE,
     VALID_DATE_CLAMP_MODES,
-    DEFAULT_BILL_FROM_INVOICES
+    DEFAULT_BILL_FROM_INVOICES,
+    DEFAULT_CUSTOM_INVOICES,
+    DEFAULT_SKIP_PRODUCE,
+    DEFAULT_SKIP_FOOD
 };

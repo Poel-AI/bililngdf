@@ -44,7 +44,7 @@ function findSourceRecord(row, lookups) {
         return lookups.byClientId.get(clientId.toLowerCase());
     }
 
-    const url = cellStr(row, 'URL', 'url');
+    const url = cellStr(row, 'Unite link', 'URL', 'url');
     if (url && lookups.byUrl.has(url.toLowerCase())) return lookups.byUrl.get(url.toLowerCase());
 
     return null;
@@ -58,8 +58,9 @@ function rowToMinimalRequest(row) {
     return {
         id,
         clientId: cellStr(row, 'ClientId', 'clientId') || null,
+        clientType: cellStr(row, 'Client type', 'clientType') || '',
         name: cellStr(row, 'Client name', 'name'),
-        url: cellStr(row, 'URL', 'url') || null,
+        url: cellStr(row, 'Unite link', 'URL', 'url') || null,
         date: start,
         endDate: end,
         start: start || undefined,

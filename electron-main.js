@@ -89,11 +89,13 @@ function ensureUserDataFiles() {
 }
 
 function createWindow(port) {
+    const { getAppDisplayName } = require('./src/appMode');
+    const title = getAppDisplayName();
     const iconPath = path.join(__dirname, 'public', 'logo.png');
     const win = new BrowserWindow({
         width: 1400,
         height: 820,
-        title: 'Diet Fantasy Billing',
+        title,
         icon: fs.existsSync(iconPath) ? iconPath : undefined,
         autoHideMenuBar: true,
         webPreferences: {
@@ -101,7 +103,7 @@ function createWindow(port) {
             contextIsolation: true,
         },
     });
-    win.setTitle('Diet Fantasy Billing');
+    win.setTitle(title);
     win.loadURL(`http://localhost:${port}`);
     win.on('closed', () => {
         app.quit();
@@ -119,7 +121,9 @@ app.whenReady().then(() => {
 
     const dotenvPath = process.env.DOTENV_PATH || path.join(__dirname, '.env');
     safeLoadDotenv(dotenvPath);
-    const listenPort = Number(process.env.PORT) || 3500;
+    const { getAppMode, getAppDisplayName, getDefaultPort } = require('./src/appMode');
+    const listenPort = Number(process.env.PORT) || getDefaultPort();
+    console.log(`[Electron] Mode: ${getAppMode()} (${getAppDisplayName()})`);
     console.log(`[Electron] Env file: ${dotenvPath} (exists: ${fs.existsSync(dotenvPath)})`);
 
     const { start } = require('./src/server');

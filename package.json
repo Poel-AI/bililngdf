@@ -1,16 +1,19 @@
 {
   "name": "df-billing-automation-server",
-  "version": "2.5.0006",
+  "version": "2.5.0019",
   "description": "Diet Fantasy billing automation (Playwright)",
   "author": "POEL AI <info@poel.ai>",
   "main": "electron-main.js",
   "scripts": {
     "start": "node src/server.js",
+    "portal": "node scripts/start-portal.js",
     "electron": "electron .",
     "install-browsers": "cross-env PLAYWRIGHT_BROWSERS_PATH=./playwright-browsers npx playwright install chromium",
     "postinstall": "node scripts/postinstall-playwright.js",
     "pack:mac": "npm run install-browsers && electron-builder --mac",
     "pack:win": "npm run install-browsers && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
+    "pack:win:clone": "npm run install-browsers && node scripts/pack-win-clone.js",
+    "pack:win:insurance": "npm run install-browsers && node scripts/pack-win-insurance.js",
     "dist": "npm run install-browsers && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder",
     "restart": "node restart.js",
     "dev": "lsof -ti:3500 | xargs kill -9 2>/dev/null; node src/server.js",
@@ -21,6 +24,8 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "playwright": "^1.40.1",
+    "qrcode": "^1.5.4",
+    "ws": "^8.22.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

@@ -13,6 +13,13 @@ const { safeLoadDotenv } = require('../safeDotenv');
 const dotenvPath = process.env.DOTENV_PATH || path.join(__dirname, '..', '..', '.env');
 safeLoadDotenv(dotenvPath);
 
+const {
+    buildClientInvoicePdfUrl,
+    mergeCustomInvoiceForRequest,
+    validateCustomInvoiceGlobalParams,
+    validateCustomInvoiceParams
+} = require('./clientInvoicePdf');
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -59,6 +66,7 @@ function describeReqDateFields(req) {
     if (!req || typeof req !== 'object') return {};
     return {
         name: req.name,
+        startDate: req.startDate,
         date: req.date,
         endDate: req.endDate,
         start: req.start,
@@ -96,7 +104,7 @@ function uniteCredsMissingHint(apiConfig) {
 // --- API CONFIG DEFAULTS ---
 const CUSTOMER_API_BASE = 'https://customer.thedietfantasy.com';
 const DEFAULT_API_BASE_URL = CUSTOMER_API_BASE;
-const DEFAULT_API_KEY = process.env.EXTENSION_API_KEY || 'justtomakesureicanlockyouout';
+const DEFAULT_API_KEY = process.env.EXTENSION_API_KEY || 'ZestoPresto';
 
 function normalizeCustomerApiUrl(urlStr) {
     if (urlStr == null || typeof urlStr !== 'string') return urlStr;
@@ -114,10 +122,31 @@ function firstProofUrlRaw(req) {
     return '';
 }
 
-/** Use client invoice PDF flow: invoice list mode, or any row whose proof URL is the client-invoice-pdf endpoint. */
-function wantsClientInvoicePdf(req) {
-    if (req.useClientInvoicePdf === true) return true;
-    return /client-invoice-pdf/i.test(firstProofUrlRaw(req));
+function resolveApiInvoiceUrl(req, isProduce) {
+    const url = isProduce ? req.produceInvoice : req.mealInvoice;
+    return url ? String(url).trim() : '';
+}
+
+/** Use client invoice PDF flow: custom invoice params, meal/produce invoice links, legacy proof, or invoice list mode. */
+function wantsClientInvoicePdf(req, customInvoicesMode = false, customInvoiceParams = null) {
+    if (customInvoicesMode && customInvoiceParams) return true;
+    if (req.mealInvoice || req.produceInvoice) return true;
+    if (firstProofUrlRaw(req)) return true;
+    return req.useClientInvoicePdf === true;
+}
+
+function resolveInvoicePdfHttpUrl(req, baseUrl, customInvoicesMode = false, customInvoiceParams = null, isProduce = false) {
+    if (customInvoicesMode && customInvoiceParams) {
+        const merged = mergeCustomInvoiceForRequest(req, customInvoiceParams, baseUrl);
+        return buildClientInvoicePdfUrl(baseUrl, merged);
+    }
+    const apiInvoice = resolveApiInvoiceUrl(req, isProduce);
+    if (apiInvoice) {
+        return resolveClientInvoicePdfHttpUrl(normalizeCustomerApiUrl(apiInvoice), baseUrl);
+    }
+    const raw = firstProofUrlRaw(req);
+    if (!raw) return null;
+    return resolveClientInvoicePdfHttpUrl(normalizeCustomerApiUrl(raw), baseUrl);
 }
 
 /** Resolve relative invoice PDF path against Diet Fantasy API base (browser would hit CORS from UniteUs; we fetch in Node). */
@@ -134,6 +163,52 @@ function resolveClientInvoicePdfHttpUrl(raw, baseUrl) {
     }
 }
 
+function isProduceServiceType(serviceType) {
+    return String(serviceType || '').toLowerCase().includes('produce');
+}
+
+function parseApiAmount(val) {
+    if (val == null || val === '') return null;
+    if (typeof val === 'number' && Number.isFinite(val)) return val > 0 ? val : null;
+    const n = parseFloat(String(val).replace(/[$,]/g, ''));
+    return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function resolveApiBillingAmount(req, isProduce) {
+    return isProduce ? parseApiAmount(req.produceAmount) : parseApiAmount(req.mealAmount);
+}
+
+/** Inclusive calendar days between two UTC midnight Dates. */
+function inclusiveUtcDayCount(startUtc, endUtc) {
+    return Math.floor((endUtc - startUtc) / (1000 * 60 * 60 * 24)) + 1;
+}
+
+/**
+ * Food (non-produce) amount clamp: weekly amount is billed as amount/7 per day.
+ * Subtract one daily share for each day removed by date clamping.
+ * @returns {{ amount: number, daysRemoved: number, dailyRate: number } | null} null if no change
+ */
+function clampFoodAmountForRemovedDays(amount, originalStartUtc, originalEndUtc, finalStartUtc, finalEndUtc) {
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    if (!originalStartUtc || !originalEndUtc || !finalStartUtc || !finalEndUtc) return null;
+    const origDays = inclusiveUtcDayCount(originalStartUtc, originalEndUtc);
+    const finalDays = inclusiveUtcDayCount(finalStartUtc, finalEndUtc);
+    const daysRemoved = origDays - finalDays;
+    if (daysRemoved <= 0) return null;
+    const dailyRate = amount / 7;
+    const next = Math.round((amount - dailyRate * daysRemoved) * 100) / 100;
+    return { amount: next, daysRemoved, dailyRate };
+}
+
+/** Produce clients bill from API `date`; meal clients from API `startDate`. */
+function resolveBillingStartIso(req, isProduce) {
+    const primary = isProduce ? req.date : req.startDate;
+    if (primary && ISO_DATE_RE.test(String(primary))) return String(primary);
+    const fallback = isProduce ? req.startDate : req.date;
+    if (fallback && ISO_DATE_RE.test(String(fallback))) return String(fallback);
+    return null;
+}
+
 function appendProduceQueryParam(urlStr, isProduce) {
     if (!isProduce || !urlStr) return urlStr;
     try {
@@ -148,22 +223,46 @@ function appendProduceQueryParam(urlStr, isProduce) {
 /**
  * Download invoice PDF from app server, return data URL for in-page upload (avoids cross-origin fetch from UniteUs).
  */
-async function loadClientInvoiceProofAsDataUrl(req, authInfo, apiConfig, emitEvent, slotLabel) {
+async function loadClientInvoiceProofAsDataUrl(
+    req, authInfo, apiConfig, emitEvent, slotLabel, customInvoicesMode = false, customInvoiceParams = null
+) {
     const baseUrl = apiConfig?.baseUrl || DEFAULT_API_BASE_URL;
-    const raw = firstProofUrlRaw(req);
-    if (!raw) {
-        const err = new Error('[PROOF] Client invoice PDF URL missing (expected proofURLs[0] or proofURL)');
+    if (customInvoicesMode && customInvoiceParams) {
+        const globalErr = validateCustomInvoiceGlobalParams(customInvoiceParams);
+        if (globalErr) {
+            const err = new Error(`[PROOF] ${globalErr}`);
+            err.code = 'CUSTOM_INVOICE_INVALID';
+            throw err;
+        }
+        const merged = mergeCustomInvoiceForRequest(req, customInvoiceParams, baseUrl);
+        const rowErr = validateCustomInvoiceParams(merged);
+        if (rowErr) {
+            const err = new Error(`[PROOF] ${req.name || 'Client'}: ${rowErr}`);
+            err.code = 'CUSTOM_INVOICE_INVALID';
+            throw err;
+        }
+    }
+    const isProduce = isProduceServiceType(authInfo?.serviceType);
+    let httpUrl = resolveInvoicePdfHttpUrl(req, baseUrl, customInvoicesMode, customInvoiceParams, isProduce);
+    if (!httpUrl) {
+        const invoiceField = isProduce ? 'produceInvoice' : 'mealInvoice';
+        const err = new Error(`[PROOF] Client invoice PDF URL missing (expected ${invoiceField}, proofURLs[0], or custom invoice fields)`);
         err.code = 'INVOICE_PDF_FETCH_FAILED';
         throw err;
     }
-    let httpUrl = resolveClientInvoicePdfHttpUrl(normalizeCustomerApiUrl(raw), baseUrl);
-    const st = String(authInfo?.serviceType || '').toLowerCase();
-    const isProduce = st.includes('produce');
-    httpUrl = appendProduceQueryParam(httpUrl, isProduce);
+    const usedApiInvoice = !customInvoicesMode && !!resolveApiInvoiceUrl(req, isProduce);
+    if (!customInvoicesMode && !usedApiInvoice) {
+        httpUrl = appendProduceQueryParam(httpUrl, isProduce);
+    }
     const prefix = slotLabel ? `[${slotLabel}] ` : '';
     if (emitEvent) {
+        const source = customInvoicesMode
+            ? 'custom invoice'
+            : usedApiInvoice
+                ? (isProduce ? 'produceInvoice' : 'mealInvoice')
+                : 'proof link';
         emitEvent('log', {
-            message: `${prefix}${req.name || 'Client'}: Downloading client invoice PDF${isProduce ? ' (produce=1)' : ''}…`,
+            message: `${prefix}${req.name || 'Client'}: Downloading client invoice PDF (${source})…`,
             type: 'info'
         });
     }
@@ -199,15 +298,72 @@ function parseBillingError(message) {
     return { step, type, details: details || msg };
 }
 
-/** Human-readable list of invoice costs from check-only scrape (matches fee-schedule cards). */
-function formatCheckOnlyInvoiceAmounts(results) {
-    if (!Array.isArray(results) || results.length === 0) return '';
-    const joinAmounts = (amounts) =>
-        Array.isArray(amounts) && amounts.length > 0 ? amounts.join(', ') : '—';
-    if (results.length === 1) {
-        return joinAmounts(results[0].amounts);
+/** Comma-separated unit amounts from each matched Unite invoice card (e.g. $1,008.00, $864.00). */
+function formatCheckOnlyBillAmounts(matchedInvoices, results) {
+    if (Array.isArray(matchedInvoices) && matchedInvoices.length > 0) {
+        return matchedInvoices.map((inv) => inv.amount || '—').join(', ');
     }
-    return results.map((r) => `${r.start}: ${joinAmounts(r.amounts)}`).join('; ');
+    if (!Array.isArray(results)) return '';
+    const amounts = [];
+    for (const r of results) {
+        if (Array.isArray(r.amounts)) amounts.push(...r.amounts);
+    }
+    return amounts.join(', ');
+}
+
+function formatPageCardStartsHint(pageCardStarts, max = 6) {
+    if (!Array.isArray(pageCardStarts) || pageCardStarts.length === 0) return '';
+    const slice = pageCardStarts.slice(0, max);
+    const tail = pageCardStarts.length > max ? ` (+${pageCardStarts.length - max} more)` : '';
+    return ` on-page starts: ${slice.join(', ')}${tail}`;
+}
+
+/** ISO start/end for check-only: clamped billing range, queue row dates, or list download filter. */
+function resolveCheckOnlyRangeIso(req) {
+    const iso = (v) => v != null && ISO_DATE_RE.test(String(v)) ? String(v) : null;
+    const start = iso(req.start) || iso(req.startDate) || iso(req.date) || iso(req.listFilterStart);
+    const end = iso(req.end) || iso(req.endDate) || iso(req.listFilterEnd);
+    return { start, end };
+}
+
+function formatCheckOnlyStatusMessage(results, scanMeta, pageCardStarts, checkOnlyDebugDates) {
+    const onPage = Number(scanMeta?.cards) || 0;
+    const pageHint = formatPageCardStartsHint(pageCardStarts);
+
+    if (!results || results.length === 0) {
+        return checkOnlyDebugDates.length > 0
+            ? 'Check-only: (no valid dates)'
+            : `Check-only: 0 (${onPage} on page${pageHint})`;
+    }
+    if (results.length === 1) {
+        const c = results[0].count;
+        const rangeLabel =
+            results[0].end && results[0].end !== results[0].start
+                ? `${results[0].start}–${results[0].end}`
+                : results[0].start;
+        if (c === 0 && onPage > 0) {
+            return `Check-only: 0 for ${rangeLabel} (${onPage} on page${pageHint})`;
+        }
+        if (results[0].end && results[0].end !== results[0].start) {
+            return `Check-only: ${c} (${rangeLabel})`;
+        }
+        return `Check-only: ${c}`;
+    }
+    const parts = results.map((r) => `${r.start}→${r.count}`);
+    if (onPage > 0 && results.every((r) => r.count === 0)) {
+        return `Check-only: ${parts.join(', ')} (${onPage} on page${pageHint})`;
+    }
+    return `Check-only: ${parts.join(', ')}`;
+}
+
+/** Unite case pages rarely reach networkidle; wait for DOM then optional short idle. */
+async function navigateToClientCasePage(page, url, timeoutMs = 90000) {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    try {
+        await page.waitForLoadState('networkidle', { timeout: 20000 });
+    } catch {
+        /* continuous polling on Unite — same as auth.js */
+    }
 }
 
 // --- Helpers for API ---
@@ -554,41 +710,6 @@ async function updateOrderStatusForRequest(req, status, config) {
 }
 
 /**
- * POST authorized amount and expiration date for a client to the app's update-client-authorization endpoint.
- * Uses apiConfig when provided, otherwise env EXTENSION_API_BASE_URL and EXTENSION_API_KEY.
- * @param {Function} [emitEvent] - Optional: (type, data) to broadcast to UI for clear logging
- * @param {string} [slotLabel] - Optional: e.g. "Slot 0" for log prefix
- */
-async function updateClientAuthorization(clientId, authorizedAmount, expirationDate, config, emitEvent = null, slotLabel = '') {
-    if (!clientId || authorizedAmount == null || !expirationDate) return;
-    const baseUrl = config?.baseUrl || DEFAULT_API_BASE_URL;
-    const key = config?.key || DEFAULT_API_KEY;
-    const prefix = slotLabel ? `[${slotLabel}] ` : '';
-
-    const logMsg = `Client auth API: clientId=${clientId} | authorizedAmount=$${authorizedAmount} | expirationDate=${expirationDate}`;
-    console.log(`[API] ${logMsg}`);
-    if (emitEvent) emitEvent('log', { message: `${prefix}[Auth API] Sending: ${logMsg}`, type: 'info' });
-
-    try {
-        await axios.post(`${baseUrl}/api/extension/update-client-authorization`, {
-            clientId,
-            authorizedAmount: Number(authorizedAmount),
-            expirationDate
-        }, {
-            headers: {
-                'Authorization': `Bearer ${key}`,
-                'Content-Type': 'application/json'
-            }
-        });
-        console.log('[API] Client authorization updated successfully.');
-        if (emitEvent) emitEvent('log', { message: `${prefix}[Auth API] ✓ Client authorization updated (amount + expiration saved).`, type: 'success' });
-    } catch (err) {
-        console.error(`[API] update-client-authorization failed for ${clientId}:`, err.message);
-        if (emitEvent) emitEvent('log', { message: `${prefix}[Auth API] ✗ Failed: ${err.message}`, type: 'error' });
-    }
-}
-
-/**
  * Main worker entry point.
  * @param {Array} requests - (Legacy) requests if passed directly, or null if using internal fetch
  * @param {function} emitEvent - Function to emit socket events
@@ -651,9 +772,15 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
     const slotIndex = options.slotIndex ?? 0;
     const uploadAttestations = options.uploadAttestations !== false;
     const checkOnlyMode = options.checkOnlyMode === true;
+    const customInvoicesMode = options.customInvoices === true;
+    const customInvoiceParams = customInvoicesMode && options.customInvoiceParams
+        ? options.customInvoiceParams
+        : null;
     const checkOnlyDebugDates = Array.isArray(options.checkOnlyDebugDates) ? options.checkOnlyDebugDates : [];
     const submitInvoice = options.submitInvoice !== false;
     const dateClampMode = options.dateClampMode === 'client_created' ? 'client_created' : 'auth';
+    const skipProduce = options.skipProduce === true;
+    const skipFood = options.skipFood === true;
 
     const emitSlotStatus = (stage, clientName = '') => {
         emitEvent('slotStatus', { slotIndex, slotLabel, clientName, stage });
@@ -722,6 +849,7 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
         req.status = 'processing';
         req.message = 'Starting...';
         delete req.checkOnlyInvoiceAmounts;
+        delete req.checkOnlyInvoices;
         emitQueue();
         emitSlotStatus('Starting client', req.name);
         emitEvent('log', { message: `${slotLabel ? `[${slotLabel}] ` : ''}Processing ${req.name} (${i + 1}/${toProcess.length})` });
@@ -737,17 +865,12 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
             continue;
         }
 
-        // --- Base Date Calculation (Initial 7-day window) ---
+        // --- Base Date Calculation (endDate now; start resolved after page scrape by client type) ---
         try {
-            const [year, month, day] = req.date.split('-').map(Number);
-            const reqStart = new Date(Date.UTC(year, month - 1, day));
-            const reqEnd = new Date(reqStart);
-            reqEnd.setUTCDate(reqEnd.getUTCDate() + 6); // 7 days inclusive
-
-            const toISO = (d) => d.toISOString().split('T')[0];
-
-            req.start = toISO(reqStart);
-            req.end = (req.endDate && String(req.endDate).match(/^\d{4}-\d{2}-\d{2}$/)) ? String(req.endDate) : toISO(reqEnd);
+            if (!req.endDate || !ISO_DATE_RE.test(String(req.endDate))) {
+                throw new Error(`Missing valid endDate (got: ${JSON.stringify(req.endDate)})`);
+            }
+            req.end = String(req.endDate);
 
             if (req.isBrooklyn) {
                 const isoRe = ISO_DATE_RE;
@@ -764,9 +887,7 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
                     if (apiConfig) await updateOrderStatusForRequest(req, 'billing_failed', apiConfig);
                     continue;
                 }
-                emitEvent('log', { message: `Brooklyn week: ${req.start} to ${req.end}, service date: ${req.deliveryDate}` });
-            } else {
-                emitEvent('log', { message: `Requested range: ${req.start} to ${req.end}` });
+                emitEvent('log', { message: `Brooklyn billing end: ${req.end}, service date: ${req.deliveryDate}` });
             }
         } catch (e) {
             req.status = 'failed';
@@ -816,13 +937,63 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
                     const attemptLabel = `(S${restartAttempt + 1}/R${refreshAttempt + 1})`;
                     emitSlotStatus(`Open client URL ${attemptLabel}`, req.name);
                     emitEvent('log', { message: `Navigating to ${req.url} ${attemptLabel}...` });
-                    await page.goto(req.url, { waitUntil: 'networkidle', timeout: 60000 });
+                    await navigateToClientCasePage(page, req.url);
                     await sleep(3000);
 
                     emitSlotStatus('Read auth table & limits', req.name);
                     // Scrape Auth Info for Clamping (wait for table like injected billing, then retry if cells still empty)
                     const authInfo = await fetchAuthDetailsFromPageWhenReady(page);
                     emitEvent('log', { message: `${slotLabel ? `[${slotLabel}] ` : ''}[Auth] Scraped from page: authorizedDates="${authInfo.authorizedDates || '—'}", dateOpened="${authInfo.dateOpened || '—'}", authorizedAmount="${authInfo.authorizedAmount || '—'}", serviceType="${authInfo.serviceType || '—'}"` });
+
+                    const isProduceClient = isProduceServiceType(authInfo.serviceType);
+                    const billingStart = resolveBillingStartIso(req, isProduceClient);
+                    if (!billingStart) {
+                        const field = isProduceClient ? 'date' : 'startDate';
+                        throw new Error(`[DATES] Missing valid ${field} for ${isProduceClient ? 'produce' : 'meal'} client`);
+                    }
+                    req.start = billingStart;
+                    emitEvent('log', {
+                        message: `${slotLabel ? `[${slotLabel}] ` : ''}Billing range: ${req.start} → ${req.end} (${isProduceClient ? 'produce: date + endDate' : 'meal: startDate + endDate'})`,
+                        type: 'info'
+                    });
+
+                    if (!checkOnlyMode && (skipProduce || skipFood)) {
+                        if (skipProduce && isProduceClient) {
+                            req.status = 'skipped';
+                            req.message = 'Skipped: Produce client (Skip produce is on)';
+                            emitSlotStatus('Skipped', req.name);
+                            emitEvent('log', {
+                                message: `${slotLabel ? `[${slotLabel}] ` : ''}⚠️ ${req.name}: Skipped — Service Type "${authInfo.serviceType || '—'}" is Produce.`,
+                                type: 'warning'
+                            });
+                            resultSourceStatus = 'skipped_produce';
+                            success = true;
+                            break;
+                        }
+                        if (skipFood && !isProduceClient) {
+                            req.status = 'skipped';
+                            req.message = 'Skipped: Food/MTM client (Skip food is on)';
+                            emitSlotStatus('Skipped', req.name);
+                            emitEvent('log', {
+                                message: `${slotLabel ? `[${slotLabel}] ` : ''}⚠️ ${req.name}: Skipped — Service Type "${authInfo.serviceType || '—'}" is food/MTM (not Produce).`,
+                                type: 'warning'
+                            });
+                            resultSourceStatus = 'skipped_food';
+                            success = true;
+                            break;
+                        }
+                    }
+
+                    if (!checkOnlyMode) {
+                        const apiAmount = resolveApiBillingAmount(req, isProduceClient);
+                        if (apiAmount != null) {
+                            req.amount = apiAmount;
+                            emitEvent('log', {
+                                message: `${slotLabel ? `[${slotLabel}] ` : ''}Amount from API: $${req.amount} (${isProduceClient ? 'produceAmount' : 'mealAmount'})`,
+                                type: 'info'
+                            });
+                        }
+                    }
 
                     // Clamping Logic
                     const parseMDY = (s) => {
@@ -832,9 +1003,6 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
                     };
 
                     const dateOpened = parseMDY(authInfo.dateOpened);
-                    const authDatesMatch = String(authInfo.authorizedDates || '').match(/(\d{1,2})\/\d{1,2}\/\d{4}\s*-\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-                    const authEnd = authDatesMatch ? new Date(Date.UTC(+authDatesMatch[4], +authDatesMatch[2] - 1, +authDatesMatch[3])) : null;
-                    const expirationISO = authEnd ? authEnd.toISOString().split('T')[0] : null;
 
                     if (!checkOnlyMode && dateClampMode === 'client_created') {
                         const cc = evaluateClientCreatedClampRules(req, authInfo, dateOpened);
@@ -855,24 +1023,8 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
                         }
                     }
 
-                    // Send authorized amount and expiration date to app API (when clientId present)
-                    if (!checkOnlyMode && req.clientId) {
-                        const amountNum = parseFloat(String(authInfo.authorizedAmount || '').replace(/[$,]/g, '')) || null;
-                        if (amountNum != null && expirationISO) {
-                            emitSlotStatus('Push auth to app API', req.name);
-                            await updateClientAuthorization(req.clientId, amountNum, expirationISO, apiConfig, emitEvent, slotLabel);
-                        } else {
-                            const reason = !amountNum && !expirationISO ? 'missing amount and expiration' : !amountNum ? 'missing authorized amount' : 'missing expiration date';
-                            emitEvent('log', { message: `${slotLabel ? `[${slotLabel}] ` : ''}[Auth API] Skipped (${reason}). clientId=${req.clientId}`, type: 'warning' });
-                        }
-                    } else if (!checkOnlyMode) {
-                        emitEvent('log', { message: `${slotLabel ? `[${slotLabel}] ` : ''}[Auth API] Skipped (no clientId on request).`, type: 'info' });
-                    } else {
-                        emitEvent('log', { message: `${slotLabel ? `[${slotLabel}] ` : ''}[Auth API] Skipped (check-only mode).`, type: 'info' });
-                    }
-
                     if (req.isBrooklyn) {
-                        emitSlotStatus('Clamp delivery date to auth window', req.name);
+                        emitSlotStatus('Clamp delivery date to Date Opened', req.name);
                         const toISO = (d) => d.toISOString().split('T')[0];
                         let delivery = new Date(req.deliveryDate + 'T00:00:00Z');
 
@@ -880,75 +1032,110 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
                             emitEvent('log', { message: `[Clamping] Delivery date ${req.deliveryDate} is before Date Opened ${authInfo.dateOpened}. Adjusting...` });
                             delivery = dateOpened;
                         }
-                        if (authEnd && delivery > authEnd) {
-                            emitEvent('log', { message: `[Clamping] Delivery date ${req.deliveryDate} is after Auth End. Adjusting...` });
-                            delivery = authEnd;
-                        }
-                        if ((dateOpened && delivery < dateOpened) || (authEnd && delivery > authEnd)) {
-                            const error = new Error(`[LIMITS] Delivery date ${req.deliveryDate} is outside auth window (${authInfo.dateOpened || 'N/A'} to ${(authInfo.authorizedDates || '').split('-').pop()?.trim() || 'N/A'})`);
+                        if (dateOpened && delivery < dateOpened) {
+                            const error = new Error(`[LIMITS] Delivery date ${req.deliveryDate} is before Date Opened (${authInfo.dateOpened || 'N/A'})`);
                             error.code = 'NO_OVERLAP';
                             throw error;
                         }
 
                         req.deliveryDate = toISO(delivery);
                         emitEvent('log', { message: `Brooklyn service date (delivery): ${req.deliveryDate}` });
-                    } else if (dateOpened || authEnd) {
-                        emitSlotStatus('Clamp dates to auth window', req.name);
+                    } else if (dateOpened) {
+                        // Start only: API already sets end date. Do not clamp to Auth End.
+                        emitSlotStatus('Clamp start to Date Opened', req.name);
                         const currentStart = new Date(req.start + 'T00:00:00Z');
                         const currentEnd = new Date(req.end + 'T00:00:00Z');
                         let finalStart = currentStart;
-                        let finalEnd = currentEnd;
+                        const finalEnd = currentEnd;
 
-                        if (dateOpened && currentStart < dateOpened) {
+                        if (currentStart < dateOpened) {
                             emitEvent('log', { message: `[Clamping] Start date ${req.start} is before Date Opened ${authInfo.dateOpened}. Adjusting...` });
                             finalStart = dateOpened;
-                        }
-                        if (authEnd && currentEnd > authEnd) {
-                            emitEvent('log', { message: `[Clamping] End date ${req.end} is after Auth End ${authInfo.authorizedDates.split('-')[1]}. Adjusting...` });
-                            finalEnd = authEnd;
                         }
 
                         if (finalEnd < finalStart) {
                             const toISO = (d) => d.toISOString().split('T')[0];
                             const reqRange = `${req.start} to ${req.end}`;
-                            const authEndDisp = (authInfo.authorizedDates || '').split('-').map((s) => s.trim()).filter(Boolean).pop() || 'N/A';
-                            const error = new Error(`[LIMITS] No overlap: Requested (${reqRange}) is outside Date Opened / Auth End (${authInfo.dateOpened || 'N/A'} to ${authEndDisp})`);
+                            const error = new Error(`[LIMITS] No overlap: Requested (${reqRange}) is before Date Opened (${authInfo.dateOpened || 'N/A'})`);
                             error.code = 'NO_OVERLAP';
                             throw error;
                         }
 
                         const toISO = (d) => d.toISOString().split('T')[0];
+                        const prevStart = req.start;
+                        const prevEnd = req.end;
                         req.start = toISO(finalStart);
                         req.end = toISO(finalEnd);
 
                         const diffDays = Math.floor((finalEnd - finalStart) / (1000 * 60 * 60 * 24)) + 1;
                         emitEvent('log', { message: `Final adjusted range: ${req.start} to ${req.end} (${diffDays} days)` });
 
-                        // Amount = 48/day when dates were clamped (injected logic uses this for MTM only; Produce stays per-person)
-                        req.datesWereClamped = true;
-                        req.amount = diffDays * 48;
-                        emitEvent('log', { message: `Amount for adjusted range: $${req.amount} (48 × ${diffDays} days)` });
+                        // Food only: reduce weekly amount by (amount/7) per day clamped off (start side)
+                        if (!isProduceClient) {
+                            const baseAmount =
+                                (typeof req.amount === 'number' && Number.isFinite(req.amount) && req.amount > 0)
+                                    ? req.amount
+                                    : resolveApiBillingAmount(req, false);
+                            const adj = clampFoodAmountForRemovedDays(
+                                baseAmount,
+                                currentStart,
+                                currentEnd,
+                                finalStart,
+                                finalEnd
+                            );
+                            if (adj) {
+                                if (!(adj.amount > 0)) {
+                                    const error = new Error(
+                                        `[LIMITS] Amount clamped to $${adj.amount} after removing ${adj.daysRemoved} day(s) from ${prevStart}–${prevEnd} (daily $${adj.dailyRate.toFixed(2)})`
+                                    );
+                                    error.code = 'NO_OVERLAP';
+                                    throw error;
+                                }
+                                const before = baseAmount;
+                                req.amount = adj.amount;
+                                if (req.mealAmount != null && req.mealAmount !== '') {
+                                    req.mealAmount = adj.amount;
+                                }
+                                emitEvent('log', {
+                                    message: `[Clamping] Food amount $${before} → $${adj.amount} (−${adj.daysRemoved} day(s) × $${adj.dailyRate.toFixed(2)}/day)`,
+                                    type: 'info'
+                                });
+                            }
+                        }
                     }
 
                     // --- Check-only mode: count existing billing records (no submit) ---
                     if (checkOnlyMode) {
                         emitSlotStatus('Check existing billing records', req.name);
+                        const checkRange = resolveCheckOnlyRangeIso(req);
                         const countReq =
                             checkOnlyDebugDates.length > 0
                                 ? { ...req, checkOnlyStarts: checkOnlyDebugDates }
-                                : req;
-                        const { results } = await countExistingBillingRecordsOnPage(page, countReq);
+                                : { ...req, start: checkRange.start, end: checkRange.end };
+                        const { results, scanMeta, pageCardStarts, matchedInvoices } =
+                            await countExistingBillingRecordsOnPage(page, countReq);
+                        const checkDate =
+                            Array.isArray(countReq.checkOnlyStarts) && countReq.checkOnlyStarts.length > 0
+                                ? countReq.checkOnlyStarts.join(', ')
+                                : checkRange.start && checkRange.end && checkRange.end !== checkRange.start
+                                  ? `${checkRange.start}–${checkRange.end}`
+                                  : checkRange.start || '—';
+                        emitEvent('log', {
+                            message: `${slotLabel ? `[${slotLabel}] ` : ''}[Check-only] Counting cards with start in ${checkDate} | page cards=${scanMeta?.cards ?? '?'} (dated=${scanMeta?.dated ?? '?'}, cost=${scanMeta?.cost ?? '?'})${formatPageCardStartsHint(pageCardStarts, 8)}`,
+                            type: scanMeta?.cards > 0 ? 'info' : 'warning'
+                        });
                         req.status = 'success';
-                        req.checkOnlyInvoiceAmounts = formatCheckOnlyInvoiceAmounts(results || []);
-                        if (!results || results.length === 0) {
-                            req.message =
-                                checkOnlyDebugDates.length > 0 ? 'Check-only: (no valid dates)' : 'Check-only: 0';
-                        } else if (results.length === 1) {
-                            req.message = `Check-only: ${results[0].count}`;
-                        } else {
-                            req.message = `Check-only: ${results.map((r) => `${r.start}→${r.count}`).join(', ')}`;
-                        }
+                        req.checkOnlyPageCardCount = Number(scanMeta?.cards) || 0;
+                        req.checkOnlyInvoices = Array.isArray(matchedInvoices) ? matchedInvoices : [];
+                        req.checkOnlyInvoiceAmounts = formatCheckOnlyBillAmounts(req.checkOnlyInvoices, results);
+                        req.message = formatCheckOnlyStatusMessage(
+                            results || [],
+                            scanMeta,
+                            pageCardStarts,
+                            checkOnlyDebugDates
+                        );
                         emitEvent('log', { message: `${slotLabel ? `[${slotLabel}] ` : ''}${req.name}: ${req.message}`, type: 'success' });
+                        emitQueue();
                         resultSourceStatus = 'checked_only';
                         success = true;
                         break;
@@ -962,9 +1149,11 @@ async function billingWorker(initialRequests, emitEvent, source = 'file', apiCon
                         req.proofURL = null;
                         if (req.proofURLs) req.proofURLs = [];
                         emitEvent('log', { message: `${slotLabel ? `[${slotLabel}] ` : ''}Skipping attestations/proofs (disabled).`, type: 'info' });
-                    } else if (wantsClientInvoicePdf(req)) {
+                    } else if (wantsClientInvoicePdf(req, customInvoicesMode, customInvoiceParams)) {
                         emitSlotStatus('Download invoice PDF', req.name);
-                        const { dataUrl } = await loadClientInvoiceProofAsDataUrl(req, authInfo, apiConfig, emitEvent, slotLabel);
+                        const { dataUrl } = await loadClientInvoiceProofAsDataUrl(
+                            req, authInfo, apiConfig, emitEvent, slotLabel, customInvoicesMode, customInvoiceParams
+                        );
                         req.proofURL = dataUrl;
                         const cleanName = (req.name || 'Client').replace(/\s+/g, ' ').trim().replace(/[\\/:*?"<>|]/g, '');
                         const toDashMDY = (iso) => {

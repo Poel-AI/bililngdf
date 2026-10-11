@@ -17,24 +17,40 @@ function householdPeople(r) {
     return Math.max(1, 1 + deps);
 }
 
+const UNITE_LINK_COLUMN = 'Unite link';
+
 function buildQueueRows(queue) {
     return queue.map((r) => {
         const total = parseQueueAmount(r.amount);
         const people = householdPeople(r);
         const perPerson =
             total != null ? Math.round((total / people) * 100) / 100 : '';
+        const insuranceFlat = Array.isArray(r.insuranceResults) ? r.insuranceResults : [];
         return {
             'Client name': r.name || '',
             Id: r.id != null ? String(r.id) : r.orderID != null ? String(r.orderID) : '',
             ClientId: r.clientId != null ? String(r.clientId) : '',
+            'Client type': r.clientType != null ? String(r.clientType) : '',
+            [UNITE_LINK_COLUMN]: r.url || '',
+            'Facesheet URL': r.insuranceProfileUrl || '',
             Start: r.start || r.date || '',
             End: r.end || r.endDate || '',
             'Per person': perPerson,
             Status: r.status || 'pending',
-            'Invoice cost (check-only)': r.checkOnlyInvoiceAmounts || '',
+            'Invoice amounts (check-only)':
+                r.checkOnlyInvoiceAmounts != null && String(r.checkOnlyInvoiceAmounts).trim() !== ''
+                    ? String(r.checkOnlyInvoiceAmounts).trim()
+                    : Array.isArray(r.checkOnlyInvoices)
+                      ? r.checkOnlyInvoices.map((i) => i.amount || '—').join(', ')
+                      : '',
+            'Invoice status (check-only)': Array.isArray(r.checkOnlyInvoices)
+                ? r.checkOnlyInvoices.map((i) => i.status || '—').join('; ')
+                : '',
+            'Insurance plans': insuranceFlat.map((x) => x.plan || '').filter(Boolean).join('; '),
+            'Insurance status': insuranceFlat.map((x) => x.status || '').filter(Boolean).join('; '),
+            'Insurance detail': insuranceFlat.map((x) => x.detail || '').filter(Boolean).join('; '),
             Message: r.message || '',
             'Order numbers': Array.isArray(r.orderNumbers) ? r.orderNumbers.join(', ') : '',
-            URL: r.url || ''
         };
     });
 }

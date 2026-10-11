@@ -40,12 +40,12 @@
                 <button type="button" id="btn-show-browser" class="btn btn-outline btn-toggle"
                     title="Visible browser window">Show browser: Off</button>
                 <button type="button" id="btn-check-only" class="btn btn-outline btn-toggle"
-                    title="When on, the run will NOT create billing. It counts fee-schedule cards whose service range start matches the client’s start date, or the comma-separated dates below if multi-date is on (end date ignored).">Check-only: Off</button>
+                    title="When on, no billing is created. Counts fee-schedule cards whose service range start falls within the row’s start–end dates (e.g. client list 4/01–6/08), or exact comma-separated dates when multi-date is on.">Check-only: Off</button>
                 <button type="button" id="btn-check-only-multi-debug" class="btn btn-outline btn-toggle"
                     title="With Check-only on: enter comma-separated YYYY-MM-DD dates below to count each date on the page (overrides each client’s server start). Saved to .env.">Multi-date check: Off</button>
                 <button type="button" id="btn-submit-invoice" class="btn btn-outline btn-toggle"
                     title="When off (testing): fills the billing form but does not click Post; shows a Continue bar until you click it. Saved to .env.">Submit invoice: On</button>
-                <button type="button" id="btn-bill-invoices-endpoint" class="btn btn-outline btn-toggle btn-toggle--on"
+                <button type="button" id="btn-bill-invoices-endpoint" class="btn btn-outline btn-toggle btn-toggle--on ui-hidden"
                     title="When on (default): load the queue from GET /api/bill/invoices?date=… and attach the client invoice PDF as proof. When off: legacy GET /api/bill. Saved to .env.">Invoice as proof: On</button>
                 <button type="button" id="btn-save-settings" class="btn btn-outline">Save settings</button>
                 <button type="button" id="btn-open-source-files" class="btn btn-outline">Open source files</button>
@@ -77,16 +77,22 @@
                     <div class="field-group">
                         <label for="serverSelect">Account</label>
                         <select id="serverSelect" class="input-select"
-                            title="Brooklyn adds account=brooklyn to the API request; host is always customer.thedietfantasy.com">
+                            title="Adds ?account= to the client list API; host is always customer.thedietfantasy.com. Billing rules follow Main except Brooklyn.">
                             <option value="main">Diet Fantasy (Main)</option>
                             <option value="brooklyn">Brooklyn</option>
+                            <option value="yonkers">Yonkers</option>
                         </select>
                     </div>
                     <div class="field-group">
                         <label for="bill-date">Billing week starts</label>
                         <input type="date" id="bill-date" class="input-date" title="First day for the billing list" />
                     </div>
-                    <div class="field-group">
+                    <div class="field-group" id="bill-end-date-group">
+                        <label for="bill-end-date">List end date</label>
+                        <input type="date" id="bill-end-date" class="input-date"
+                            title="Passed to GET /api/bill/invoices as endDate=… (with date= billing week start)" />
+                    </div>
+                    <div class="field-group ui-hidden">
                         <label for="date-clamp-mode">Date clamping</label>
                         <select id="date-clamp-mode" class="input-select" title="Auth window: clamp to scraped limits on the case. Client created: require JSON created-at; error if before case open; skip if case opened in or after billing week. Saved to .env.">
                             <option value="auth">Auth window (page)</option>
@@ -108,6 +114,10 @@
                             title="When on, builds proof PDFs and attaches them in Unite. When off, that step is skipped.">
                             Upload proofs: On
                         </button>
+                        <button type="button" id="btn-custom-invoice" class="btn btn-outline btn-toggle btn-toggle--compact"
+                            title="When on: build custom invoice PDFs (clientId from each proof link) and show invoice line fields below.">
+                            Custom invoice: Off
+                        </button>
                     </div>
                     <button type="button" id="btn-export-excel" class="btn btn-outline">Export to Excel</button>
                 </div>
@@ -116,6 +126,23 @@
                     <span class="stat-pill stat-pill--pending"><span class="stat-pill__label">Waiting</span> <b id="stat-pending">0</b></span>
                     <span class="stat-pill stat-pill--ok"><span class="stat-pill__label">Done</span> <b id="stat-success">0</b></span>
                     <span class="stat-pill stat-pill--bad"><span class="stat-pill__label">Failed</span> <b id="stat-failed">0</b></span>
+                </div>
+            </div>
+            <div id="custom-invoice-fields-row" class="toolbar__row toolbar__custom-invoice">
+                <p class="toolbar__custom-invoice-hint">Custom invoice line (client ID from each row’s proof link). Period = billing week start → list end date.</p>
+                <div class="toolbar__custom-invoice-fields">
+                    <div class="field-group field-group--wide">
+                        <label for="ci-item-name">Item name</label>
+                        <input type="text" id="ci-item-name" class="input-search" placeholder="Home delivery meal" spellcheck="false" />
+                    </div>
+                    <div class="field-group">
+                        <label for="ci-quantity">Quantity</label>
+                        <input type="number" id="ci-quantity" class="input-search input-search--narrow" min="0" step="1" placeholder="42" />
+                    </div>
+                    <div class="field-group">
+                        <label for="ci-unit-price">Unit price</label>
+                        <input type="number" id="ci-unit-price" class="input-search input-search--narrow" min="0" step="0.01" placeholder="16" />
+                    </div>
                 </div>
             </div>
         </section>
@@ -155,12 +182,13 @@
                                 </th>
                                 <th onclick="sortQueue('id')">#</th>
                                 <th onclick="sortQueue('name')">Client</th>
+                                <th onclick="sortQueue('clientType')">Type</th>
                                 <th onclick="sortQueue('start')">Dates</th>
                                 <th onclick="sortQueue('created')">Created</th>
                                 <th onclick="sortQueue('url')">Unite case</th>
                                 <th onclick="sortQueue('proofs')">Proof</th>
                                 <th onclick="sortQueue('status')">Status</th>
-                                <th onclick="sortQueue('checkOnlyInvoiceAmounts')" title="Invoice cost from fee-schedule cards (check-only runs)">Invoice cost</th>
+                                <th onclick="sortQueue('checkOnlyInvoiceAmounts')" title="Check-only: dollar amount on each matching Unite invoice (comma-separated)">Invoice $ (check-only)</th>
                                 <th onclick="sortQueue('message')">Details</th>
                             </tr>
                         </thead>

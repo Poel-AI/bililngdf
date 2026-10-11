@@ -1,0 +1,27 @@
+[Unit]
+Description=Diet Fantasy billing portal
+After=network.target
+
+[Service]
+Type=simple
+User=df
+Group=df
+WorkingDirectory=/opt/dietfantasy
+Environment=PORTAL_MODE=1
+Environment=PORT=3500
+Environment=PORTAL_BIND=127.0.0.1
+Environment=PORTAL_DATA_DIR=/var/lib/dietfantasy
+Environment=DOTENV_PATH=/etc/dietfantasy/secrets.env
+Environment=NODE_ENV=production
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/dietfantasy/playwright-browsers
+Environment=USE_SYSTEM_CHROME=false
+Environment=PORTAL_MAX_JOBS=2
+Environment=PORTAL_MAX_BROWSERS=4
+EnvironmentFile=-/etc/dietfantasy/secrets.env
+ExecStart=/usr/bin/node src/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

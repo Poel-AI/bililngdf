@@ -16,7 +16,7 @@ const SESSION_FILE = () => path.join(getAppDataDir(), 'billing_session.json');
 const COMPLETED_STATUSES = new Set(['success', 'warning', 'skipped']);
 
 /** Fields only needed during live billing — never persist (PDF data URLs are ~0.5–2 MB each). */
-const EPHEMERAL_REQUEST_FIELDS = ['proofURL', 'checkOnlyInvoiceAmounts', 'fileName'];
+const EPHEMERAL_REQUEST_FIELDS = ['proofURL', 'fileName'];
 
 function stripEphemeralRequestFields(req) {
     if (!req || typeof req !== 'object') return req;

@@ -1,0 +1,50 @@
+{
+  "appId": "com.dietfantasy.billing-automation-clone",
+  "productName": "Diet Fantasy Billing Clone",
+  "icon": "public/logo.png",
+  "files": [
+    "src/**/*",
+    "public/**/*",
+    "node_modules/**/*",
+    "electron-main.js",
+    ".env",
+    "billing_requests_template.json",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "playwright-browsers",
+      "to": "playwright-browsers",
+      "filter": [
+        "**/*"
+      ]
+    }
+  ],
+  "mac": {
+    "category": "public.app-category.utilities",
+    "target": [
+      "dmg"
+    ]
+  },
+  "win": {
+    "signAndEditExecutable": false,
+    "target": [
+      "nsis"
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "allowElevation": true,
+    "perMachine": false,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "runAfterFinish": true,
+    "shortcutName": "Diet Fantasy Billing Clone",
+    "uninstallDisplayName": "Diet Fantasy Billing Clone"
+  },
+  "artifactName": "Diet Fantasy Billing Clone Setup ${version}.${ext}",
+  "directories": {
+    "output": "dist-clone"
+  }
+}

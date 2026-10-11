@@ -7,58 +7,123 @@ const uniteSelectors = require('../uniteSelectors');
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Scroll the billing / fee-schedule section into view so lazy lists hydrate.
+ */
+async function scrollBillingSectionIntoView(page, sel) {
+    const addBtnId = sel.addButton?.id || 'add-fee-schedule-service-provided-button';
+    const scan = sel.duplicateScan || {};
+    const cardClass = (scan.cardClass || 'fee-schedule-provided-service-card').replace(/^\./, '');
+    try {
+        await page.evaluate(({ addBtnId, cardClass }) => {
+            const targets = [
+                document.getElementById(addBtnId),
+                document.querySelector('.' + cardClass)
+            ].filter(Boolean);
+            for (const el of targets) {
+                el.scrollIntoView({ block: 'center', inline: 'center' });
+            }
+        }, { addBtnId, cardClass });
+    } catch (_) { /* ignore */ }
+}
+
+/**
  * Wait until Unite has rendered fee-schedule cards and at least one card shows cost or
  * service delivery dates (React hydration / lazy list).
+ * Also waits for the "Add contracted service" button — a stable landmark on the billing panel.
  */
 async function waitForUniteFeeScheduleCardsReady(page, sel, timeoutMs = 48000) {
     const scan = sel.duplicateScan || {};
     const cardClass = (scan.cardClass || 'fee-schedule-provided-service-card').replace(/^\./, '');
     const amountTest = scan.amountDataTest || 'unit-amount-value';
-    const deadline = Date.now() + timeoutMs;
-    let last = { cards: 0, dated: 0, cost: 0 };
+    const datesTests = Array.isArray(scan.datesDataTest)
+        ? scan.datesDataTest
+        : [scan.datesDataTest || 'service-dates-value', 'service-start-date-value'];
+    const addBtnId = sel.addButton?.id || 'add-fee-schedule-service-provided-button';
+    const addBtnSel = '#' + addBtnId;
+
+    await scrollBillingSectionIntoView(page, sel);
+
+    const landmarkTimeout = Math.min(timeoutMs, 30000);
     try {
-        await page.evaluate(({ cardClass }) => {
-            const el = document.querySelector('.' + cardClass);
-            if (el) el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-        }, { cardClass });
-    } catch (_) { /* ignore */ }
-    while (Date.now() < deadline) {
+        await page.waitForSelector(addBtnSel, { state: 'visible', timeout: landmarkTimeout });
+    } catch (e) {
+        console.warn(
+            `[BillingActions] Billing panel landmark (${addBtnSel}) not visible after ${landmarkTimeout}ms: ${e.message}`
+        );
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    let last = { cards: 0, dated: 0, cost: 0, addButtonVisible: false };
+
+    const pollCards = async () => {
         try {
-            last = await page.evaluate(({ cardClass, amountTest }) => {
+            last = await page.evaluate(({ cardClass, amountTest, datesTests, addBtnId }) => {
+                const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+                const addBtn = document.getElementById(addBtnId);
+                const addButtonVisible = !!(addBtn && (addBtn.offsetParent !== null || (addBtn.getClientRects?.().length || 0) > 0));
                 const cards = document.querySelectorAll('.' + cardClass);
                 let dated = 0;
                 let cost = 0;
                 for (const c of cards) {
-                    const d = (c.querySelector('[data-test-element="service-dates-value"]')?.textContent || '')
-                        .replace(/\s+/g, ' ')
-                        .trim();
-                    if (d.length > 2) dated += 1;
-                    const a = (c.querySelector('[data-test-element="' + amountTest + '"]')?.textContent || '')
-                        .replace(/\s+/g, ' ')
-                        .trim();
+                    let dateText = '';
+                    for (const key of datesTests) {
+                        const el = c.querySelector('[data-test-element="' + key + '"]');
+                        const t = norm(el?.textContent);
+                        if (t) {
+                            dateText = t;
+                            break;
+                        }
+                    }
+                    if (dateText.length > 2) dated += 1;
+                    const a = norm(c.querySelector('[data-test-element="' + amountTest + '"]')?.textContent || '');
                     if (a.length > 0) cost += 1;
                 }
-                return { cards: cards.length, dated, cost };
-            }, { cardClass, amountTest });
+                return { cards: cards.length, dated, cost, addButtonVisible };
+            }, { cardClass, amountTest, datesTests, addBtnId });
         } catch (_) {
-            last = { cards: 0, dated: 0, cost: 0 };
+            last = { cards: 0, dated: 0, cost: 0, addButtonVisible: false };
         }
-        if (last.cards > 0 && (last.dated > 0 || last.cost > 0)) return last;
+    };
+
+    while (Date.now() < deadline) {
+        await pollCards();
+        if (last.cards > 0 && (last.dated > 0 || last.cost > 0)) {
+            console.log(
+                `[BillingActions] Fee-schedule cards ready: cards=${last.cards} dated=${last.dated} cost=${last.cost}`
+            );
+            return last;
+        }
+        if (last.cards === 0 && Date.now() + 2000 > deadline) {
+            await scrollBillingSectionIntoView(page, sel);
+        }
         await sleepMs(350);
+    }
+
+    await pollCards();
+    if (last.cards === 0) {
+        console.warn(
+            `[BillingActions] Fee-schedule wait timed out (${timeoutMs}ms) with 0 cards — page may still be loading or client has no billing entries. addButtonVisible=${last.addButtonVisible}`
+        );
+    } else {
+        console.warn(
+            `[BillingActions] Fee-schedule wait timed out (${timeoutMs}ms) before cards hydrated: cards=${last.cards} dated=${last.dated} cost=${last.cost}`
+        );
     }
     return last;
 }
 
 /**
- * Count how many fee-schedule cards have the same **service start date** as
- * each requested ISO date. The card's end date is ignored.
- * If `requestData.checkOnlyStarts` is a non-empty array of YYYY-MM-DD strings, counts for each;
- * otherwise uses `requestData.start` only.
- * @returns {{ results: Array<{ start: string, count: number, amounts: string[] }> }}
+ * Count fee-schedule cards on the page.
+ * - `checkOnlyStarts`: exact match on each ISO start date (multi-date debug).
+ * - Brooklyn: single `deliveryDate`.
+ * - Otherwise: if `start` and `end` span multiple days, count cards whose range **start**
+ *   falls inclusively between `start` and `end` (e.g. client list 2026-04-01–2026-06-08).
+ * - Single-day / one-week rows: exact match on `start` only.
+ * @returns {{ results: Array<{ start: string, end?: string, count: number, amounts: string[] }> }}
  */
 async function countExistingBillingRecordsOnPage(page, requestData) {
     const sel = uniteSelectors.billing;
-    await waitForUniteFeeScheduleCardsReady(page, sel);
+    const scanMeta = await waitForUniteFeeScheduleCardsReady(page, sel);
     const result = await page.evaluate((arg) => {
         const { data, sel } = arg;
         const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -115,6 +180,12 @@ async function countExistingBillingRecordsOnPage(page, requestData) {
 
         const isoRe = /^\d{4}-\d{2}-\d{2}$/;
         let wantIsoList = [];
+        let rangeMode = false;
+        let rangeStart = null;
+        let rangeEnd = null;
+        let rangeStartIso = '';
+        let rangeEndIso = '';
+
         if (Array.isArray(data.checkOnlyStarts) && data.checkOnlyStarts.length > 0) {
             const seen = new Set();
             for (const raw of data.checkOnlyStarts) {
@@ -125,6 +196,16 @@ async function countExistingBillingRecordsOnPage(page, requestData) {
             }
         } else if (data.isBrooklyn && data.deliveryDate && isoRe.test(norm(data.deliveryDate))) {
             wantIsoList = [norm(data.deliveryDate)];
+        } else if (data.start && data.end && isoRe.test(norm(data.start)) && isoRe.test(norm(data.end))) {
+            rangeStartIso = norm(data.start);
+            rangeEndIso = norm(data.end);
+            rangeStart = isoToDate(rangeStartIso);
+            rangeEnd = isoToDate(rangeEndIso);
+            if (rangeStart && rangeEnd && rangeEnd.getTime() > rangeStart.getTime()) {
+                rangeMode = true;
+            } else if (rangeStartIso) {
+                wantIsoList = [rangeStartIso];
+            }
         } else if (data.start && isoRe.test(norm(data.start))) {
             wantIsoList = [norm(data.start)];
         }
@@ -145,6 +226,38 @@ async function countExistingBillingRecordsOnPage(page, requestData) {
             return '';
         };
 
+        const scrapeCardInvoiceMeta = (card) => {
+            let invoiceNumber = '';
+            let status = '';
+            const headerClass = (scan.invoiceHeaderRowClass || 'mt-2 flex space-x-2').trim();
+            const headerRow =
+                card.querySelector('.' + headerClass.replace(/\s+/g, '.')) ||
+                card.querySelector('[class*="space-x-2"]');
+            if (headerRow) {
+                const invoiceLink = Array.from(headerRow.querySelectorAll('a')).find((a) =>
+                    /Invoice\s*#/i.test(norm(a.textContent))
+                );
+                if (invoiceLink) {
+                    const im = norm(invoiceLink.textContent).match(/Invoice\s*#\s*([A-Za-z0-9]+)/i);
+                    if (im) invoiceNumber = im[1];
+                    const siblings = Array.from(headerRow.children).map((c) => norm(c.textContent)).filter(Boolean);
+                    const invIdx = siblings.findIndex((s) => /Invoice\s*#/i.test(s));
+                    if (invIdx >= 0 && siblings[invIdx + 1] && !/^\w+ \d{1,2}, \d{4}$/.test(siblings[invIdx + 1])) {
+                        status = siblings[invIdx + 1];
+                    }
+                }
+            }
+            if (!status || !invoiceNumber) {
+                const blob = norm(card.innerText).slice(0, 900);
+                const sm = blob.match(/Invoice\s*#([A-Za-z0-9]+)\s+((?:Submitted|Transmitted to Payer|[^\n]+?))(?=\s*Cost:)/i);
+                if (sm) {
+                    if (!invoiceNumber) invoiceNumber = sm[1];
+                    if (!status) status = sm[2].trim();
+                }
+            }
+            return { invoiceNumber, status };
+        };
+
         const wantDates = wantIsoList.map((iso) => isoToDate(iso)).filter(Boolean);
         const counts = {};
         const amountLists = {};
@@ -153,11 +266,33 @@ async function countExistingBillingRecordsOnPage(page, requestData) {
             amountLists[iso] = [];
         }
 
-        if (wantDates.length === 0) {
-            return { results: [] };
+        if (!rangeMode && wantDates.length === 0) {
+            return { results: [], pageCardStarts: [], matchedInvoices: [] };
         }
 
+        const dateToIso = (d) => {
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${y}-${m}-${day}`;
+        };
+
         const cards = Array.from(document.querySelectorAll('.' + cardClass));
+        const pageCardStarts = [];
+        const matchedInvoices = [];
+        const rangeAmounts = [];
+        let rangeCount = 0;
+
+        const pushMatchedInvoice = (cardStartIso, serviceDates, amtRaw, card) => {
+            const { invoiceNumber, status } = scrapeCardInvoiceMeta(card);
+            matchedInvoices.push({
+                serviceStart: cardStartIso,
+                serviceDates,
+                amount: amtRaw || '—',
+                invoiceNumber: invoiceNumber || '',
+                status: status || ''
+            });
+        };
 
         for (const card of cards) {
             const txt = getServiceDatesTextFromCard(card);
@@ -168,16 +303,45 @@ async function countExistingBillingRecordsOnPage(page, requestData) {
             const cardStart = parseCardRangeStart(parts[0] || '');
             if (!cardStart) continue;
 
+            const cardStartIso = dateToIso(cardStart);
+            pageCardStarts.push(cardStartIso);
+
             const amtRaw = norm(card.querySelector('[data-test-element="' + amtTest + '"]')?.textContent || '');
+
+            if (rangeMode) {
+                if (cardStart.getTime() >= rangeStart.getTime() && cardStart.getTime() <= rangeEnd.getTime()) {
+                    rangeCount += 1;
+                    rangeAmounts.push(amtRaw || '—');
+                    pushMatchedInvoice(cardStartIso, txt, amtRaw, card);
+                }
+                continue;
+            }
 
             for (let i = 0; i < wantDates.length; i++) {
                 if (sameDay(cardStart, wantDates[i])) {
                     counts[wantIsoList[i]] += 1;
                     amountLists[wantIsoList[i]].push(amtRaw || '—');
+                    pushMatchedInvoice(cardStartIso, txt, amtRaw, card);
                 }
             }
         }
+
+        if (rangeMode) {
+            return {
+                pageCardStarts,
+                matchedInvoices,
+                results: [{
+                    start: rangeStartIso,
+                    end: rangeEndIso,
+                    count: rangeCount,
+                    amounts: rangeAmounts
+                }]
+            };
+        }
+
         return {
+            pageCardStarts,
+            matchedInvoices,
             results: wantIsoList.map((iso) => ({
                 start: iso,
                 count: counts[iso],
@@ -187,11 +351,24 @@ async function countExistingBillingRecordsOnPage(page, requestData) {
     }, { data: requestData, sel });
 
     if (!result || typeof result !== 'object' || !Array.isArray(result.results)) {
-        return { results: [] };
+        return { results: [], scanMeta, pageCardStarts: [], matchedInvoices: [] };
     }
+    const matchedInvoices = Array.isArray(result.matchedInvoices)
+        ? result.matchedInvoices.map((inv) => ({
+            serviceStart: String(inv.serviceStart || ''),
+            serviceDates: String(inv.serviceDates || ''),
+            amount: String(inv.amount ?? ''),
+            invoiceNumber: String(inv.invoiceNumber || ''),
+            status: String(inv.status || '')
+        }))
+        : [];
     return {
+        scanMeta,
+        pageCardStarts: Array.isArray(result.pageCardStarts) ? result.pageCardStarts.map(String) : [],
+        matchedInvoices,
         results: result.results.map((r) => ({
             start: String(r.start || ''),
+            end: r.end != null && String(r.end).trim() !== '' ? String(r.end) : undefined,
             count: Number.isFinite(r.count) && r.count >= 0 ? r.count : 0,
             amounts: Array.isArray(r.amounts) ? r.amounts.map((a) => String(a ?? '')) : []
         }))
@@ -410,29 +587,49 @@ async function executeBillingOnPage(page, requestData, execOptions = {}) {
 
             const { dateEl, amountEl, dateOpenedEl, serviceTypeEl } = getAuthEls();
 
-            // --- Service Type: set amount per person (336 or 146 if Produce) ---
+            // --- Service Type + API billing amount (mealAmount / produceAmount) ---
             const numDependants = (data.dependants && Array.isArray(data.dependants)) ? data.dependants.length : 0;
             const people = 1 + numDependants;
+            const parseApiAmount = (val) => {
+                if (val == null || val === '') return null;
+                if (typeof val === 'number' && Number.isFinite(val)) return val > 0 ? val : null;
+                const n = parseFloat(String(val).replace(/[$,]/g, ''));
+                return Number.isFinite(n) && n > 0 ? n : null;
+            };
             if (serviceTypeEl) {
                 const serviceTypeText = (serviceTypeEl.textContent || serviceTypeEl.innerText || '').trim();
                 isProduce = serviceTypeText.toLowerCase().includes('produce');
-                amount = isProduce ? 146 * people : 336 * people;
-                console.log(`[Injected] Service Type: "${serviceTypeText}" → ${isProduce ? 'Produce' : 'MTM'}, ${people} person(s), amount: $${amount}`);
             } else {
-                amount = (typeof data.amount === 'number' && data.amount > 0) ? data.amount : 336 * people;
-                console.warn('[Injected] Service Type element not found; using amount from API or default $336/person:', amount);
+                console.warn('[Injected] Service Type element not found; inferring produce from API amounts if possible');
+            }
+            const apiMeal = parseApiAmount(data.mealAmount);
+            const apiProduce = parseApiAmount(data.produceAmount);
+            if (isProduce && apiProduce != null) {
+                amount = apiProduce;
+                console.log(`[Injected] Produce client — using produceAmount: $${amount}`);
+            } else if (!isProduce && apiMeal != null) {
+                amount = apiMeal;
+                console.log(`[Injected] Meal client — using mealAmount: $${amount}`);
+            } else if (typeof data.amount === 'number' && data.amount > 0) {
+                amount = data.amount;
+                console.log(`[Injected] Using pre-set amount: $${amount}`);
+            } else if (serviceTypeEl) {
+                amount = isProduce ? 146 * people : 336 * people;
+                console.warn(`[Injected] API amounts missing; legacy fallback (${isProduce ? 'Produce' : 'MTM'} × ${people}): $${amount}`);
+            } else {
+                amount = 336 * people;
+                console.warn('[Injected] Service Type and API amounts missing; default $336/person:', amount);
             }
 
             if (!dateEl || !amountEl) {
                 console.warn('[Injected] Authorized table elements not found. Continuing, but risks are high.');
             } else {
                 console.log('[Injected] Authorized table found. Verifying limits...');
-                // Authorized delivery range (end only used for clamping; start bound is Date Opened — same as billingWorker)
+                // Authorized delivery range end is informational (API owns billing end; clamp uses Date Opened only)
                 // Date format usually: "8/27/2025 - 2/27/2026"
                 const dateText = dateEl.innerText || '';
                 const rangeParts = dateText.split(/\s*-\s*/).map((s) => s.trim());
                 const endStr = rangeParts[1] || '';
-                const authEnd = endStr ? parseMDY(endStr) : null;
 
                 const normTxt = (s) => String(s || '').trim();
                 const dateOpenedP = dateOpenedEl?.querySelector('p.service-case-program-entry__text');
@@ -450,61 +647,69 @@ async function executeBillingOnPage(page, requestData, execOptions = {}) {
                 console.log('[Injected] Authorized Amount:', (amountEl.innerText || '').trim());
                 console.log('[Injected] Date Opened:', dateOpenedRaw || 'N/A');
                 console.log('[Injected] Authorized range text:', dateText.trim() || 'N/A');
-                console.log('[Injected] Auth end (clamp):', endStr || 'N/A', '| Max: $' + authAmount);
+                console.log('[Injected] Auth end (info only, not clamped):', endStr || 'N/A', '| Max: $' + authAmount);
 
-                // --- CLAMPING LOGIC (synced with billingWorker: start = Date Opened, end = auth range end) ---
+                // --- CLAMPING LOGIC (synced with billingWorker: start = Date Opened only; API owns end date) ---
                 if (isBrooklyn) {
                     console.log(`[Clamping-Debug] Brooklyn delivery date: ${toMDY(deliveryDateObj)}`);
-                    console.log(`[Clamping-Debug] Clamp window: Date Opened ${dateOpenedBound ? toMDY(dateOpenedBound) : 'N/A'} .. Auth End ${authEnd ? toMDY(authEnd) : 'N/A'}`);
+                    console.log(`[Clamping-Debug] Clamp lower bound: Date Opened ${dateOpenedBound ? toMDY(dateOpenedBound) : 'N/A'}`);
                     if (dateOpenedBound && deliveryDateObj < dateOpenedBound) {
                         console.warn(`[Clamping] Delivery ${toMDY(deliveryDateObj)} is BEFORE Date Opened ${toMDY(dateOpenedBound)}. Adjusting...`);
                         deliveryDateObj.setTime(dateOpenedBound.getTime());
                     }
-                    if (authEnd && deliveryDateObj > authEnd) {
-                        console.warn(`[Clamping] Delivery ${toMDY(deliveryDateObj)} is AFTER Auth End ${toMDY(authEnd)}. Adjusting...`);
-                        deliveryDateObj.setTime(authEnd.getTime());
-                    }
-                    if ((dateOpenedBound && deliveryDateObj < dateOpenedBound) || (authEnd && deliveryDateObj > authEnd)) {
-                        const authRangeEndDisp = endStr || 'N/A';
+                    if (dateOpenedBound && deliveryDateObj < dateOpenedBound) {
                         return {
                             ok: false,
-                            error: `[LIMITS] Delivery date ${toMDY(deliveryDateObj)} is outside Date Opened / Auth End (${dateOpenedRaw || 'N/A'} to ${authRangeEndDisp})`
+                            error: `[LIMITS] Delivery date ${toMDY(deliveryDateObj)} is before Date Opened (${dateOpenedRaw || 'N/A'})`
                         };
                     }
                     verifyStart = deliveryDateObj;
                     verifyEnd = deliveryDateObj;
-                } else if (dateOpenedBound || authEnd) {
-                    // CLAMPING DEBUG LOGS
+                } else if (dateOpenedBound) {
+                    // Start only — do not clamp end to Auth End (API sets end date)
+                    const origStartMs = reqStart.getTime();
+                    const origEndMs = reqEnd.getTime();
                     console.log(`[Clamping-Debug] Original Req Start: ${toMDY(reqStart)} (${reqStart.toISOString()})`);
                     console.log(`[Clamping-Debug] Original Req End:   ${toMDY(reqEnd)} (${reqEnd.toISOString()})`);
-                    console.log(`[Clamping-Debug] Clamp window:        Date Opened ${dateOpenedBound ? toMDY(dateOpenedBound) : 'N/A'} .. Auth End ${authEnd ? toMDY(authEnd) : 'N/A'}`);
+                    console.log(`[Clamping-Debug] Clamp lower bound:  Date Opened ${toMDY(dateOpenedBound)}`);
 
-                    if (dateOpenedBound && reqStart < dateOpenedBound) {
+                    if (reqStart < dateOpenedBound) {
                         console.warn(`[Clamping] Requested start ${toMDY(reqStart)} is BEFORE Date Opened ${toMDY(dateOpenedBound)}. Adjusting...`);
                         reqStart.setTime(dateOpenedBound.getTime());
                     }
-                    if (authEnd && reqEnd > authEnd) {
-                        console.warn(`[Clamping] Requested end ${toMDY(reqEnd)} is AFTER auth end ${toMDY(authEnd)}. Adjusting to ${toMDY(authEnd)}.`);
-                        reqEnd.setTime(authEnd.getTime());
-                    }
 
                     console.log(`[Clamping-Debug] Final Req Start:    ${toMDY(reqStart)}`);
-                    console.log(`[Clamping-Debug] Final Req End:      ${toMDY(reqEnd)}`);
+                    console.log(`[Clamping-Debug] Final Req End:      ${toMDY(reqEnd)} (unchanged)`);
 
-                    // Fix overlap
                     if (reqStart > reqEnd) {
-                        const authRangeEndDisp = endStr || 'N/A';
                         return {
                             ok: false,
-                            error: `[LIMITS] No overlap: requested (${toMDY(data.start)} to ${toMDY(data.end)}) is outside Date Opened / Auth End (${dateOpenedRaw || 'N/A'} to ${authRangeEndDisp})`
+                            error: `[LIMITS] No overlap: requested (${toMDY(data.start)} to ${toMDY(data.end)}) is before Date Opened (${dateOpenedRaw || 'N/A'})`
                         };
                     }
 
-                    // For regular (MTM) clients only: when dates were clamped in worker, use 48 × days × people
-                    if (!isProduce && data.datesWereClamped && typeof data.amount === 'number' && data.amount > 0) {
-                        amount = data.amount * people;
-                        console.log(`[Injected] Dates were clamped; using 48/day × ${people} person(s) for MTM: $${amount}`);
+                    // Food only: reduce weekly amount by (amount/7) per day clamped off (start side)
+                    if (!isProduce && Number.isFinite(amount) && amount > 0) {
+                        const MS_DAY = 1000 * 60 * 60 * 24;
+                        const origDays = Math.floor((origEndMs - origStartMs) / MS_DAY) + 1;
+                        const finalDays = Math.floor((reqEnd.getTime() - reqStart.getTime()) / MS_DAY) + 1;
+                        const daysRemoved = origDays - finalDays;
+                        if (daysRemoved > 0) {
+                            const dailyRate = amount / 7;
+                            const before = amount;
+                            amount = Math.round((amount - dailyRate * daysRemoved) * 100) / 100;
+                            console.log(`[Clamping] Food amount $${before} → $${amount} (−${daysRemoved} day(s) × $${dailyRate.toFixed(2)}/day)`);
+                            if (!(amount > 0)) {
+                                return {
+                                    ok: false,
+                                    error: `[LIMITS] Amount clamped to $${amount} after removing ${daysRemoved} day(s) (daily $${dailyRate.toFixed(2)})`
+                                };
+                            }
+                        }
                     }
+
+                    verifyStart = reqStart;
+                    verifyEnd = reqEnd;
                 }
 
                 // Amount vs max auth (runs whenever we parsed a numeric auth max)
@@ -1450,6 +1655,44 @@ async function executeBillingOnPage(page, requestData, execOptions = {}) {
                 console.log('[Step] No dependants to process.');
             }
 
+            // --- Meals (MTM) or Weeks (Produce) metadata field ---
+            currentStep = isProduce ? 'weeks' : 'meals';
+            const fillMetadataNumberField = (cfg, value, label) => {
+                const fieldId = (cfg && cfg.id) || 'unit_amount_display';
+                const fieldName = cfg && cfg.name;
+                const el =
+                    (fieldName ? document.querySelector(`input[name="${fieldName}"]`) : null) ||
+                    document.getElementById(fieldId);
+                if (!el) {
+                    console.warn(`[Step] ${label} field not found (#${fieldId}${fieldName ? `, name=${fieldName}` : ''})`);
+                    return false;
+                }
+                console.log(`[Step] Entering ${label}:`, value);
+                el.focus();
+                setNativeValue(el, String(value));
+                fire(el, 'input');
+                fire(el, 'change');
+                el.blur();
+                return true;
+            };
+
+            if (isProduce) {
+                fillMetadataNumberField(sel.weeks || {}, 1, 'Weeks');
+            } else {
+                const parseMealCount = (val) => {
+                    if (val == null || val === '') return null;
+                    if (typeof val === 'number' && Number.isFinite(val)) return val >= 0 ? val : null;
+                    const n = parseFloat(String(val).replace(/[$,]/g, ''));
+                    return Number.isFinite(n) && n >= 0 ? n : null;
+                };
+                const mealCount = parseMealCount(data.mealCount);
+                if (mealCount != null) {
+                    fillMetadataNumberField(sel.meals || {}, mealCount, 'Meals');
+                } else {
+                    console.log('[Step] No mealCount on request; skipping Meals field.');
+                }
+            }
+
             // --- Brooklyn interaction note ---
             if (isBrooklyn) {
                 currentStep = 'interaction_note';
@@ -1467,13 +1710,7 @@ async function executeBillingOnPage(page, requestData, execOptions = {}) {
                         year: 'numeric'
                     });
                 };
-                const orderUrlLines = (Array.isArray(data.orderURLs) ? data.orderURLs : [])
-                    .map((u) => String(u || '').trim())
-                    .filter(Boolean);
-                let noteText = `Services provided for the week of ${formatNoteDate(startStr)} through ${formatNoteDate(endStr)}`;
-                if (orderUrlLines.length > 0) {
-                    noteText += '\n\n' + orderUrlLines.join('\n');
-                }
+                const noteText = `Services provided for the week of ${formatNoteDate(startStr)} through ${formatNoteDate(endStr)}`;
                 console.log('[Step] Brooklyn note:', noteText);
                 noteEl.focus();
                 setNativeValue(noteEl, noteText);

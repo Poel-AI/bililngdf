@@ -1,0 +1,57 @@
+/**
+ * Switch this app from the laptop install to the DigitalOcean server.
+ * Do this once SSH access is available. The portal code is already in the repo.
+ *
+ * Target: Ubuntu 24.04 Droplet in NYC3, Basic 8 vCPU / 16 GB RAM (~$96/month).
+ */
+# 1. DNS
+# Point a hostname (example: billing.yourdomain.com) at the Droplet's public IPv4.
+
+# 2. Firewall (DigitalOcean Cloud Firewall, plus the host)
+# Inbound: 443 from anywhere, 22 from your office IPs only. Deny the rest.
+# SSH: key login only. Password authentication off.
+
+# 3. On the server
+sudo apt update && sudo apt install -y curl ca-certificates
+# Node 20
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update && sudo apt install -y caddy
+
+sudo mkdir -p /opt/dietfantasy /var/lib/dietfantasy /etc/dietfantasy
+sudo chown "$USER":"$USER" /opt/dietfantasy
+# Copy this project to /opt/dietfantasy (git clone or rsync). Do not copy node_modules.
+cd /opt/dietfantasy
+npm ci
+npx playwright install chromium
+sudo npx playwright install-deps chromium
+
+# 4. Secrets — mode 600, not in git
+# /etc/dietfantasy/secrets.env should contain the UniteUs passwords and API key
+# already used by the laptop .env, plus:
+#   PORTAL_ADMIN_EMAIL=you@example.com
+#   PORTAL_ADMIN_PASSWORD=a-long-password
+#   PORTAL_SESSION_SECRET=a-long-random-string
+#   USE_SYSTEM_CHROME=false
+sudo chown root:root /etc/dietfantasy/secrets.env
+sudo chmod 600 /etc/dietfantasy/secrets.env
+
+# 5. Process
+# Edit deploy/dietfantasy.service if the Linux user is not "df".
+sudo cp deploy/dietfantasy.service /etc/systemd/system/dietfantasy.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now dietfantasy
+
+# 6. HTTPS
+# Edit deploy/Caddyfile: replace billing.example.com with the real hostname.
+sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+
+# 7. First login
+# Open https://your-hostname/login
+# Sign in as the admin, scan the authenticator QR, then add the other people.
+# Create a workspace, open it (a second workspace can run in another browser tab).
+# Live browsers appear on the job page while a run is going.

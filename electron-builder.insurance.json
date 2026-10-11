@@ -1,0 +1,50 @@
+{
+  "appId": "com.dietfantasy.insurance-verification",
+  "productName": "Diet Fantasy Insurance",
+  "icon": "public/logo.png",
+  "files": [
+    "src/**/*",
+    "public/**/*",
+    "node_modules/**/*",
+    "electron-main.js",
+    ".env",
+    "billing_requests_template.json",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "playwright-browsers",
+      "to": "playwright-browsers",
+      "filter": [
+        "**/*"
+      ]
+    }
+  ],
+  "mac": {
+    "category": "public.app-category.utilities",
+    "target": [
+      "dmg"
+    ]
+  },
+  "win": {
+    "signAndEditExecutable": false,
+    "target": [
+      "nsis"
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "allowElevation": true,
+    "perMachine": false,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "runAfterFinish": true,
+    "shortcutName": "Diet Fantasy Insurance",
+    "uninstallDisplayName": "Diet Fantasy Insurance"
+  },
+  "artifactName": "Diet Fantasy Insurance Setup ${version}.${ext}",
+  "directories": {
+    "output": "dist-insurance"
+  }
+}

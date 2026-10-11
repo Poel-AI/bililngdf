@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Users — Diet Fantasy</title>
+    <link rel="icon" href="/logo.png" type="image/png">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="portal-page">
+        <div class="portal-top">
+            <a href="/jobs">Back to jobs</a>
+        </div>
+        <div class="portal-card">
+            <h1>People</h1>
+            <p class="lead">Everyone who can sign in sees every job. They sign in with the email and password you set here.</p>
+            <form id="create" class="portal-form">
+                <label>Name
+                    <input id="name" required>
+                </label>
+                <label>Email
+                    <input id="email" type="email" required>
+                </label>
+                <label>Temporary password (10+ characters)
+                    <input id="password" type="text" minlength="10" required>
+                </label>
+                <label>Role
+                    <select id="role">
+                        <option value="operator">Operator</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </label>
+                <button type="submit" class="btn btn-primary">Add person</button>
+            </form>
+            <p id="error" class="portal-error"></p>
+            <table class="user-table">
+                <thead>
+                    <tr><th>Email</th><th>Role</th><th>Authenticator</th><th></th></tr>
+                </thead>
+                <tbody id="rows"></tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+        const errorEl = document.getElementById('error');
+        const rows = document.getElementById('rows');
+
+        async function load() {
+            const r = await fetch('/api/users');
+            if (r.status === 401) return location.href = '/login';
+            if (r.status === 403) return location.href = '/jobs';
+            const data = await r.json();
+            rows.innerHTML = '';
+            for (const user of data.users || []) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = '<td></td><td></td><td></td><td></td>';
+                tr.children[0].textContent = user.email + (user.disabled ? ' (disabled)' : '');
+                tr.children[1].textContent = user.role;
+                tr.children[2].textContent = user.totpEnabled ? 'On' : 'Not set up';
+                const disable = document.createElement('button');
+                disable.type = 'button';
+                disable.className = 'btn btn-outline btn-compact';
+                disable.textContent = user.disabled ? 'Enable' : 'Disable';
+                disable.addEventListener('click', async () => {
+                    const res = await fetch('/api/users/' + user.id + '/disabled', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ disabled: !user.disabled }),
+                    });
+                    const body = await res.json().catch(() => ({}));
+                    if (!res.ok) errorEl.textContent = body.error || 'Update failed';
+                    else load();
+                });
+                tr.children[3].appendChild(disable);
+                rows.appendChild(tr);
+            }
+        }
+
+        document.getElementById('create').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            errorEl.textContent = '';
+            const r = await fetch('/api/users', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: document.getElementById('name').value.trim(),
+                    email: document.getElementById('email').value.trim(),
+                    password: document.getElementById('password').value,
+                    role: document.getElementById('role').value,
+                }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                errorEl.textContent = data.error || 'Could not add person';
+                return;
+            }
+            event.target.reset();
+            load();
+        });
+
+        load();
+    </script>
+</body>
+</html>

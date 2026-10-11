@@ -205,15 +205,8 @@
     });
   }
 
-  function buildNoteText(weekStartISO, weekEndISO, orderURLs) {
-    let text = `Services provided for the week of ${formatNoteDate(weekStartISO)} through ${formatNoteDate(weekEndISO)}`;
-    const urls = (Array.isArray(orderURLs) ? orderURLs : [])
-      .map((u) => String(u || '').trim())
-      .filter(Boolean);
-    if (urls.length > 0) {
-      text += '\n\n' + urls.join('\n');
-    }
-    return text;
+  function buildNoteText(weekStartISO, weekEndISO) {
+    return `Services provided for the week of ${formatNoteDate(weekStartISO)} through ${formatNoteDate(weekEndISO)}`;
   }
 
   function getServiceDateInput() {
@@ -477,13 +470,13 @@
     return { ok, value: finalVal, expected };
   }
 
-  function fillInteractionNote(weekStartISO, weekEndISO, orderURLs) {
+  function fillInteractionNote(weekStartISO, weekEndISO) {
     const ta = getNoteTextarea();
     if (!ta) {
       console.error('[Brooklyn] #interactionNote not found.');
       return { ok: false, error: 'note textarea missing' };
     }
-    const text = buildNoteText(weekStartISO, weekEndISO, orderURLs);
+    const text = buildNoteText(weekStartISO, weekEndISO);
     console.log('[Brooklyn] Setting note:', text);
     ta.focus();
     setNativeValue(ta, text);
@@ -516,7 +509,6 @@
       date,
       endDate,
       deliveryDate,
-      orderURLs,
       useCalendar = true,
     } = apiPayload || {};
 
@@ -540,7 +532,7 @@
           expected: toMDY(deliveryDate),
         }));
 
-    const noteResult = fillInteractionNote(date, endDate, orderURLs);
+    const noteResult = fillInteractionNote(date, endDate);
     const check = verify();
 
     const ok =
